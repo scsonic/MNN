@@ -467,19 +467,34 @@ void VulkanBackend::onCopyBuffer(const Tensor* srcTensor, const Tensor* dstTenso
             srcTensor = tempTensor.get();
         }
         size_t cpSize = calculateCpSize(srcTensor);
-        _requireHostBuffer(cpSize);
-        _copyTensorToBuffer(srcTensor, mHostBuffer.get(), 0, srcTensor->getType().code == halide_type_float && mUseFP16);
-        auto cmdbuffer = mCmdBufferForCopy;
-        cmdbuffer->begin(0);
-        VkBufferCopy bufferCopy;
-        bufferCopy.size = cpSize;
-        bufferCopy.dstOffset = offset;
-        bufferCopy.srcOffset = 0;
-        vkCmdCopyBuffer(cmdbuffer->get(), mHostBuffer->buffer(), buffer->buffer(),
-                        1, &bufferCopy);
-        cmdbuffer->end();
-        pushCommand(cmdbuffer->get());
-        _finish();
+        
+        void* destPtr = buffer->map(offset);
+        if (destPtr != nullptr) {
+            // Zero-copy UMA path: bypass staging buffer and Vulkan command queue
+            if (srcTensor->getType().code == halide_type_float && mUseFP16) {
+                auto srcPtr = srcTensor->host<float>();
+                auto elementCount = static_cast<size_t>(srcTensor->elementSize());
+                FLOAT_TO_HALF(srcPtr, reinterpret_cast<int16_t*>(destPtr), elementCount);
+            } else {
+                ::memcpy(destPtr, srcTensor->host<float>(), cpSize);
+            }
+            buffer->unmap();
+        } else {
+            // Fallback path
+            _requireHostBuffer(cpSize);
+            _copyTensorToBuffer(srcTensor, mHostBuffer.get(), 0, srcTensor->getType().code == halide_type_float && mUseFP16);
+            auto cmdbuffer = mCmdBufferForCopy;
+            cmdbuffer->begin(0);
+            VkBufferCopy bufferCopy;
+            bufferCopy.size = cpSize;
+            bufferCopy.dstOffset = offset;
+            bufferCopy.srcOffset = 0;
+            vkCmdCopyBuffer(cmdbuffer->get(), mHostBuffer->buffer(), buffer->buffer(),
+                            1, &bufferCopy);
+            cmdbuffer->end();
+            pushCommand(cmdbuffer->get());
+            _finish();
+        }
     } else if (dstTensor->host<float>() != nullptr) {
         // gpu->host
         _finish();
@@ -493,21 +508,36 @@ void VulkanBackend::onCopyBuffer(const Tensor* srcTensor, const Tensor* dstTenso
             dstTensor = tempTensor.get();
         }
         size_t cpSize = calculateCpSize(dstTensor);
-        _requireHostBuffer(cpSize);
         auto buffer = reinterpret_cast<VulkanBuffer*>(srcTensor->deviceId());
         auto offset = TensorUtils::getDescribeOrigin(srcTensor)->offset;
-        auto cmdbuffer = mCmdBufferForCopy;
-        cmdbuffer->begin(0);
-        VkBufferCopy bufferCopy;
-        bufferCopy.size = cpSize;
-        bufferCopy.dstOffset = 0;
-        bufferCopy.srcOffset = offset;
-        vkCmdCopyBuffer(cmdbuffer->get(), buffer->buffer(), mHostBuffer->buffer(),
-                        1, &bufferCopy);
-        cmdbuffer->end();
-        pushCommand(cmdbuffer->get());
-        _finish();
-        _copyBufferToTensor(dstTensor, mHostBuffer.get(), 0, dstTensor->getType().code == halide_type_float && mUseFP16);
+        
+        void* srcPtr = buffer->map(offset);
+        if (srcPtr != nullptr) {
+            // Zero-copy UMA path
+            if (dstTensor->getType().code == halide_type_float && mUseFP16) {
+                auto dstPtr = dstTensor->host<float>();
+                auto elementCount = static_cast<size_t>(dstTensor->elementSize());
+                HALF_TO_FLOAT(reinterpret_cast<const int16_t*>(srcPtr), dstPtr, elementCount);
+            } else {
+                ::memcpy(dstTensor->host<float>(), srcPtr, dstTensor->usize());
+            }
+            buffer->unmap();
+        } else {
+            // Fallback path
+            _requireHostBuffer(cpSize);
+            auto cmdbuffer = mCmdBufferForCopy;
+            cmdbuffer->begin(0);
+            VkBufferCopy bufferCopy;
+            bufferCopy.size = cpSize;
+            bufferCopy.dstOffset = 0;
+            bufferCopy.srcOffset = offset;
+            vkCmdCopyBuffer(cmdbuffer->get(), buffer->buffer(), mHostBuffer->buffer(),
+                            1, &bufferCopy);
+            cmdbuffer->end();
+            pushCommand(cmdbuffer->get());
+            _finish();
+            _copyBufferToTensor(dstTensor, mHostBuffer.get(), 0, dstTensor->getType().code == halide_type_float && mUseFP16);
+        }
     } else if (srcTensor->deviceId() != 0 && dstTensor->deviceId() != 0) {
         // gpu->gpu
         auto format = TensorUtils::getDescribe(dstTensor)->dimensionFormat;
