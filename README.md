@@ -1,3 +1,32 @@
+# MNN Android UMA Zero-Copy Fork
+
+> **Disclaimer**: This is a modified fork of [alibaba/MNN](https://github.com/alibaba/MNN) specifically optimized for Android devices with Unified Memory Architecture (UMA).
+
+## Why this fork?
+1. **Memory Optimization**: The original Vulkan implementation in MNN uses a staging buffer for memory copies, which essentially doubles the RAM consumption during tensor loading. On Android devices with limited RAM, loading large models (like a 4GB FLUX UNet) alongside the OS overhead causes an Out-of-Memory (OOM) crash. This fork optimizes Vulkan allocations by forcing `HOST_VISIBLE_BIT` memory and skipping the staging buffers, completely avoiding the massive 4GB memory spike.
+2. **Android Exclusive**: This modification is strictly designed and tested for Android environments with UMA.
+
+## How to compile and use in Android
+1. Build the modified MNN libraries using the Android NDK:
+```bash
+cd project/android
+mkdir build_64 && cd build_64
+cmake ../../../ -DCMAKE_TOOLCHAIN_FILE=$ANDROID_NDK/build/cmake/android.toolchain.cmake \
+      -DCMAKE_BUILD_TYPE=Release \
+      -DANDROID_ABI="arm64-v8a" \
+      -DANDROID_STL=c++_shared \
+      -DMNN_VULKAN=ON \
+      -DMNN_OPENCL=ON \
+      -DMNN_BUILD_LLM=ON \
+      -DMNN_BUILD_DIFFUSION=ON \
+      -DMNN_ARM82=ON
+make -j8
+```
+2. The compiled libraries (e.g., `libMNN.so`, `libMNN_Vulkan.so`, `libMNN_CL.so`) will be output in the `build_64` folder.
+3. Copy these shared libraries into your Android project's `app/src/main/jniLibs/arm64-v8a/` directory.
+
+---
+
 ![MNN](doc/banner.png)
 ---
 [![License](https://img.shields.io/github/license/alibaba/MNN)](LICENSE.txt)
