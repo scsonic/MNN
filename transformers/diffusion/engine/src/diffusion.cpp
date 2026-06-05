@@ -87,77 +87,85 @@ void Diffusion::loadSchedulerConfig() {
 }
 
 bool Diffusion::initRuntimeManagers(bool gpuBufferMode, int attentionHint) {
-    ScheduleConfig config;
-    BackendConfig backendConfig;
-    config.type = mBackendType;
-    if (config.type == MNN_FORWARD_CPU) {
-        config.numThread = mNumThreads;
-    } else if (config.type == MNN_FORWARD_OPENCL) {
-        int gpuMode = MNN_GPU_TUNING_FAST;
-        if (mGpuMemoryMode == GPU_MEMORY_BUFFER) gpuMode |= MNN_GPU_MEMORY_BUFFER;
-        else if (mGpuMemoryMode == GPU_MEMORY_IMAGE) gpuMode |= MNN_GPU_MEMORY_IMAGE;
-        else if (gpuBufferMode) gpuMode |= MNN_GPU_MEMORY_BUFFER;
-        config.mode = gpuMode;
-    } else {
-        config.numThread = 1;
-    }
-    backendConfig.memory = BackendConfig::Memory_Low;
-    if (mPrecisionMode == PRECISION_LOW)         backendConfig.precision = BackendConfig::Precision_Low;
-    else if (mPrecisionMode == PRECISION_NORMAL) backendConfig.precision = BackendConfig::Precision_Normal;
-    else if (mPrecisionMode == PRECISION_HIGH)   backendConfig.precision = BackendConfig::Precision_High;
-    else {
-        // AUTO: require FP32 on GPU for -inf attention mask handling
-        if (config.type == MNN_FORWARD_OPENCL || config.type == MNN_FORWARD_VULKAN)
-            backendConfig.precision = BackendConfig::Precision_High;
-        else
-            backendConfig.precision = BackendConfig::Precision_Normal;
-    }
-    config.backendConfig = &backendConfig;
+    try {
+        ScheduleConfig config;
+        BackendConfig backendConfig;
+        config.type = mBackendType;
+        if (config.type == MNN_FORWARD_CPU) {
+            config.numThread = mNumThreads;
+        } else if (config.type == MNN_FORWARD_OPENCL) {
+            int gpuMode = MNN_GPU_TUNING_FAST;
+            if (mGpuMemoryMode == GPU_MEMORY_BUFFER) gpuMode |= MNN_GPU_MEMORY_BUFFER;
+            else if (mGpuMemoryMode == GPU_MEMORY_IMAGE) gpuMode |= MNN_GPU_MEMORY_IMAGE;
+            else if (gpuBufferMode) gpuMode |= MNN_GPU_MEMORY_BUFFER;
+            config.mode = gpuMode;
+        } else {
+            config.numThread = 1;
+        }
+        backendConfig.memory = BackendConfig::Memory_Low;
+        if (mPrecisionMode == PRECISION_LOW)         backendConfig.precision = BackendConfig::Precision_Low;
+        else if (mPrecisionMode == PRECISION_NORMAL) backendConfig.precision = BackendConfig::Precision_Normal;
+        else if (mPrecisionMode == PRECISION_HIGH)   backendConfig.precision = BackendConfig::Precision_High;
+        else {
+            // AUTO: require FP32 on GPU for -inf attention mask handling
+            if (config.type == MNN_FORWARD_OPENCL || config.type == MNN_FORWARD_VULKAN)
+                backendConfig.precision = BackendConfig::Precision_High;
+            else
+                backendConfig.precision = BackendConfig::Precision_Normal;
+        }
+        config.backendConfig = &backendConfig;
 
-    auto exe = ExecutorScope::Current();
-    exe->lazyEval = false;
-    exe->setGlobalExecutorConfig(config.type, backendConfig, config.numThread);
+        auto exe = ExecutorScope::Current();
+        exe->lazyEval = false;
+        exe->setGlobalExecutorConfig(config.type, backendConfig, config.numThread);
 
-    runtime_manager_.reset(Executor::RuntimeManager::createRuntimeManager(config));
-    if (runtime_manager_ == nullptr) {
-        MNN_ERROR("Diffusion: Failed to create runtime manager\n");
+        runtime_manager_.reset(Executor::RuntimeManager::createRuntimeManager(config));
+        if (runtime_manager_ == nullptr) {
+            MNN_ERROR("Diffusion: Failed to create runtime manager\n");
+            return false;
+        }
+        if (config.type == MNN_FORWARD_OPENCL) {
+            runtime_manager_->setCache(".tempcache");
+        }
+        if (mMemoryMode == 0)      runtime_manager_->setHint(Interpreter::WINOGRAD_MEMORY_LEVEL, 0);
+        else if (mMemoryMode == 2) runtime_manager_->setHint(Interpreter::WINOGRAD_MEMORY_LEVEL, 1);
+        if (config.type == MNN_FORWARD_CPU)
+            runtime_manager_->setHint(Interpreter::DYNAMIC_QUANT_OPTIONS, 0);
+        if (attentionHint > 0)
+            runtime_manager_->setHint(Interpreter::ATTENTION_OPTION, attentionHint);
+
+        // CPU fallback runtime for text encoder on GPU backends
+        if (mTextEncoderOnCPU && (config.type == MNN_FORWARD_OPENCL || config.type == MNN_FORWARD_VULKAN)) {
+            ScheduleConfig cpuConfig;
+            cpuConfig.type = MNN_FORWARD_CPU;
+            cpuConfig.numThread = mNumThreads;
+            BackendConfig cpuBC;
+            cpuBC.memory    = BackendConfig::Memory_Low;
+            cpuBC.precision = BackendConfig::Precision_Normal;
+            cpuConfig.backendConfig = &cpuBC;
+            runtime_manager_cpu_.reset(Executor::RuntimeManager::createRuntimeManager(cpuConfig));
+            runtime_manager_cpu_->setHint(Interpreter::DYNAMIC_QUANT_OPTIONS, 0);
+        }
+        // CPU fallback runtime for VAE on GPU backends
+        if (mVaeOnCPU && (config.type == MNN_FORWARD_OPENCL || config.type == MNN_FORWARD_VULKAN)) {
+            ScheduleConfig cpuConfig;
+            cpuConfig.type = MNN_FORWARD_CPU;
+            cpuConfig.numThread = mNumThreads;
+            BackendConfig cpuBC;
+            cpuBC.memory    = BackendConfig::Memory_Low;
+            cpuBC.precision = BackendConfig::Precision_Normal;
+            cpuConfig.backendConfig = &cpuBC;
+            runtime_manager_vae_cpu_.reset(Executor::RuntimeManager::createRuntimeManager(cpuConfig));
+            runtime_manager_vae_cpu_->setHint(Interpreter::DYNAMIC_QUANT_OPTIONS, 0);
+        }
+        return true;
+    } catch (const std::exception& e) {
+        MNN_ERROR("Diffusion: Exception in initRuntimeManagers: %s\n", e.what());
+        return false;
+    } catch (...) {
+        MNN_ERROR("Diffusion: Unknown exception in initRuntimeManagers\n");
         return false;
     }
-    if (config.type == MNN_FORWARD_OPENCL) {
-        runtime_manager_->setCache(".tempcache");
-    }
-    if (mMemoryMode == 0)      runtime_manager_->setHint(Interpreter::WINOGRAD_MEMORY_LEVEL, 0);
-    else if (mMemoryMode == 2) runtime_manager_->setHint(Interpreter::WINOGRAD_MEMORY_LEVEL, 1);
-    if (config.type == MNN_FORWARD_CPU)
-        runtime_manager_->setHint(Interpreter::DYNAMIC_QUANT_OPTIONS, 0);
-    if (attentionHint > 0)
-        runtime_manager_->setHint(Interpreter::ATTENTION_OPTION, attentionHint);
-
-    // CPU fallback runtime for text encoder on GPU backends
-    if (mTextEncoderOnCPU && (config.type == MNN_FORWARD_OPENCL || config.type == MNN_FORWARD_VULKAN)) {
-        ScheduleConfig cpuConfig;
-        cpuConfig.type = MNN_FORWARD_CPU;
-        cpuConfig.numThread = mNumThreads;
-        BackendConfig cpuBC;
-        cpuBC.memory    = BackendConfig::Memory_Low;
-        cpuBC.precision = BackendConfig::Precision_Normal;
-        cpuConfig.backendConfig = &cpuBC;
-        runtime_manager_cpu_.reset(Executor::RuntimeManager::createRuntimeManager(cpuConfig));
-        runtime_manager_cpu_->setHint(Interpreter::DYNAMIC_QUANT_OPTIONS, 0);
-    }
-    // CPU fallback runtime for VAE on GPU backends
-    if (mVaeOnCPU && (config.type == MNN_FORWARD_OPENCL || config.type == MNN_FORWARD_VULKAN)) {
-        ScheduleConfig cpuConfig;
-        cpuConfig.type = MNN_FORWARD_CPU;
-        cpuConfig.numThread = mNumThreads;
-        BackendConfig cpuBC;
-        cpuBC.memory    = BackendConfig::Memory_Low;
-        cpuBC.precision = BackendConfig::Precision_Normal;
-        cpuConfig.backendConfig = &cpuBC;
-        runtime_manager_vae_cpu_.reset(Executor::RuntimeManager::createRuntimeManager(cpuConfig));
-        runtime_manager_vae_cpu_->setHint(Interpreter::DYNAMIC_QUANT_OPTIONS, 0);
-    }
-    return true;
 }
 
 VARP Diffusion::applyEulerUpdate(VARP sample, VARP noisePred, float dt) {

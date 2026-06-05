@@ -183,55 +183,63 @@ void Flux2KleinDiffusion::prepareTxtIds(float* dst, int seqLen) const {
 
 // ===== load() =====
 bool Flux2KleinDiffusion::load() {
-    AUTOTIME;
-    // Enable flash attention (ATTENTION_OPTION=8) to avoid O(N^2) memory for large seqLen
-    // (e.g. 8192 for 1024 edit). Flash attention uses block size 64.
-    if (!initRuntimeManagers(/*gpuBufferMode=*/true, /*attentionHint=*/8)) return false;
+    try {
+        AUTOTIME;
+        // Enable flash attention (ATTENTION_OPTION=8) to avoid O(N^2) memory for large seqLen
+        // (e.g. 8192 for 1024 edit). Flash attention uses block size 64.
+        if (!initRuntimeManagers(/*gpuBufferMode=*/true, /*attentionHint=*/8)) return false;
 
-    DiffusionConfig diff_config(mModelPath);
-    mModules.resize(4);
+        DiffusionConfig diff_config(mModelPath);
+        mModules.resize(4);
 
-    // [0] Text encoder - always loaded upfront (needed first, and relatively small)
-    {
-        auto path = diff_config.text_encoder_model();
-        MNN_PRINT("[Flux2Klein] Load text encoder: %s\n", path.c_str());
-        Module::Config tec; tec.shapeMutable = true;
-        auto& te_runtime = runtime_manager_cpu_ ? runtime_manager_cpu_ : runtime_manager_;
-        mModules[0].reset(Module::load({"input_ids","attention_mask"},{"prompt_embeds"}, path.c_str(), te_runtime, &tec));
-        if (!mModules[0]) { MNN_ERROR("[Flux2Klein] Failed to load text encoder\n"); return false; }
+        // [0] Text encoder - always loaded upfront (needed first, and relatively small)
+        {
+            auto path = diff_config.text_encoder_model();
+            MNN_PRINT("[Flux2Klein] Load text encoder: %s\n", path.c_str());
+            Module::Config tec; tec.shapeMutable = true;
+            auto& te_runtime = runtime_manager_cpu_ ? runtime_manager_cpu_ : runtime_manager_;
+            mModules[0].reset(Module::load({"input_ids","attention_mask"},{"prompt_embeds"}, path.c_str(), te_runtime, &tec));
+            if (!mModules[0]) { MNN_ERROR("[Flux2Klein] Failed to load text encoder\n"); return false; }
+        }
+
+        // [1] Transformer, [2] VAE decoder, [3] VAE encoder: load only if not in low memory mode
+        if (mMemoryMode != 0) {
+            Module::Config mc; mc.shapeMutable = true;
+            auto& vae_runtime = runtime_manager_vae_cpu_ ? runtime_manager_vae_cpu_ : runtime_manager_;
+            {
+                auto path = diff_config.unet_model();
+                MNN_PRINT("[Flux2Klein] Load transformer: %s\n", path.c_str());
+                mModules[1].reset(Module::load(
+                    {"hidden_states","timestep","encoder_hidden_states","txt_ids","img_ids"},
+                    {"output"}, path.c_str(), runtime_manager_, &mc));
+                if (!mModules[1]) { MNN_ERROR("[Flux2Klein] Failed to load transformer\n"); return false; }
+            }
+            {
+                auto path = diff_config.vae_decoder_model();
+                MNN_PRINT("[Flux2Klein] Load VAE decoder: %s\n", path.c_str());
+                mModules[2].reset(Module::load({"latent_sample"},{"sample"}, path.c_str(), vae_runtime, &mc));
+                if (!mModules[2]) { MNN_ERROR("[Flux2Klein] Failed to load VAE decoder\n"); return false; }
+                mModules[2]->traceOrOptimize(MNN::Interpreter::Session_Resize_Fix);
+            }
+            {
+                auto path = diff_config.vae_encoder_model();
+                MNN_PRINT("[Flux2Klein] Load VAE encoder: %s\n", path.c_str());
+                mModules[3].reset(Module::load({"sample"},{"latent_sample"}, path.c_str(), vae_runtime, &mc));
+                if (!mModules[3]) { MNN_ERROR("[Flux2Klein] Failed to load VAE encoder\n"); return false; }
+                mModules[3]->traceOrOptimize(MNN::Interpreter::Session_Resize_Fix);
+            }
+        } else {
+            MNN_PRINT("[Flux2Klein] Low memory mode: transformer, VAE decoder, VAE encoder will be loaded on demand\n");
+        }
+        mDiffConfig.reset(new DiffusionConfig(mModelPath));
+        return true;
+    } catch (const std::exception& e) {
+        MNN_ERROR("[Flux2Klein] Exception in load: %s\n", e.what());
+        return false;
+    } catch (...) {
+        MNN_ERROR("[Flux2Klein] Unknown exception in load\n");
+        return false;
     }
-
-    // [1] Transformer, [2] VAE decoder, [3] VAE encoder: load only if not in low memory mode
-    if (mMemoryMode != 0) {
-        Module::Config mc; mc.shapeMutable = true;
-        auto& vae_runtime = runtime_manager_vae_cpu_ ? runtime_manager_vae_cpu_ : runtime_manager_;
-        {
-            auto path = diff_config.unet_model();
-            MNN_PRINT("[Flux2Klein] Load transformer: %s\n", path.c_str());
-            mModules[1].reset(Module::load(
-                {"hidden_states","timestep","encoder_hidden_states","txt_ids","img_ids"},
-                {"output"}, path.c_str(), runtime_manager_, &mc));
-            if (!mModules[1]) { MNN_ERROR("[Flux2Klein] Failed to load transformer\n"); return false; }
-        }
-        {
-            auto path = diff_config.vae_decoder_model();
-            MNN_PRINT("[Flux2Klein] Load VAE decoder: %s\n", path.c_str());
-            mModules[2].reset(Module::load({"latent_sample"},{"sample"}, path.c_str(), vae_runtime, &mc));
-            if (!mModules[2]) { MNN_ERROR("[Flux2Klein] Failed to load VAE decoder\n"); return false; }
-            mModules[2]->traceOrOptimize(MNN::Interpreter::Session_Resize_Fix);
-        }
-        {
-            auto path = diff_config.vae_encoder_model();
-            MNN_PRINT("[Flux2Klein] Load VAE encoder: %s\n", path.c_str());
-            mModules[3].reset(Module::load({"sample"},{"latent_sample"}, path.c_str(), vae_runtime, &mc));
-            if (!mModules[3]) { MNN_ERROR("[Flux2Klein] Failed to load VAE encoder\n"); return false; }
-            mModules[3]->traceOrOptimize(MNN::Interpreter::Session_Resize_Fix);
-        }
-    } else {
-        MNN_PRINT("[Flux2Klein] Low memory mode: transformer, VAE decoder, VAE encoder will be loaded on demand\n");
-    }
-    mDiffConfig.reset(new DiffusionConfig(mModelPath));
-    return true;
 }
 
 // ===== Text Encoder =====
@@ -240,87 +248,103 @@ bool Flux2KleinDiffusion::load() {
 // This matches: tokenizer.apply_chat_template([{"role":"user","content":prompt}],
 //   tokenize=False, add_generation_prompt=True, enable_thinking=False)
 VARP Flux2KleinDiffusion::text_encoder_llm(const std::string& prompt) {
-    AUTOTIME;
-    if (!mModules[0]) { MNN_PRINT("[Flux2Klein] Error: text encoder not loaded\n"); return nullptr; }
+    try {
+        AUTOTIME;
+        if (!mModules[0]) { MNN_PRINT("[Flux2Klein] Error: text encoder not loaded\n"); return nullptr; }
 
-    std::vector<int> inputIds;
+        std::vector<int> inputIds;
 
 #ifdef MNN_BUILD_LLM
-    if (!mTokenizer) {
-        std::string tokPath = mModelPath + "/tokenizer.txt";
-        mTokenizer.reset(MNN::Transformer::Tokenizer::createTokenizer(tokPath));
-        if (mTokenizer)
-            MNN_PRINT("[Flux2Klein] Tokenizer loaded: %s\n", tokPath.c_str());
-        else
-            MNN_PRINT("[Flux2Klein] Warning: tokenizer load failed: %s\n", tokPath.c_str());
-    }
-    if (mTokenizer) {
-        // Apply Qwen3 chat_template (hardcoded, user-only, no thinking)
-        std::string templated = "<|im_start|>user\n" + prompt + "<|im_end|>\n<|im_start|>assistant\n";
-        inputIds = mTokenizer->encode(templated);
-        MNN_PRINT("[Flux2Klein] Tokens after chat_template: %d\n", (int)inputIds.size());
-    }
+        if (!mTokenizer) {
+            std::string tokPath = mModelPath + "/tokenizer.txt";
+            mTokenizer.reset(MNN::Transformer::Tokenizer::createTokenizer(tokPath));
+            if (mTokenizer)
+                MNN_PRINT("[Flux2Klein] Tokenizer loaded: %s\n", tokPath.c_str());
+            else
+                MNN_PRINT("[Flux2Klein] Warning: tokenizer load failed: %s\n", tokPath.c_str());
+        }
+        if (mTokenizer) {
+            // Apply Qwen3 chat_template (hardcoded, user-only, no thinking)
+            std::string templated = "<|im_start|>user\n" + prompt + "<|im_end|>\n<|im_start|>assistant\n";
+            inputIds = mTokenizer->encode(templated);
+            MNN_PRINT("[Flux2Klein] Tokens after chat_template: %d\n", (int)inputIds.size());
+        }
 #endif
 
-    if (inputIds.empty()) {
-        MNN_PRINT("[Flux2Klein] Warning: tokenize failed, using dummy tokens\n");
-        inputIds.resize(mTextSeqLen, 0);
+        if (inputIds.empty()) {
+            MNN_PRINT("[Flux2Klein] Warning: tokenize failed, using dummy tokens\n");
+            inputIds.resize(mTextSeqLen, 0);
+        }
+
+        int actualLen = (int)inputIds.size();
+        // Truncate if needed
+        if (actualLen > mTextSeqLen) {
+            inputIds.resize(mTextSeqLen);
+            actualLen = mTextSeqLen;
+        }
+        // Pad to mTextSeqLen (matching Python: padding='max_length', max_length=512)
+        // padding token id = 0, attention_mask = 0 for padding positions
+        int seqLen = mTextSeqLen;
+        inputIds.resize(seqLen, 0);
+
+        // Build input_ids [1, seqLen] and attention_mask [1, seqLen]
+        INTS idShape = {1, seqLen};
+        auto idsVar  = _Input(idShape, NCHW, halide_type_of<int>());
+        auto maskVar = _Input(idShape, NCHW, halide_type_of<int>());
+        auto idsPtr  = idsVar->writeMap<int>();
+        auto maskPtr = maskVar->writeMap<int>();
+        for (int i = 0; i < seqLen; ++i) {
+            idsPtr[i]  = inputIds[i];
+            maskPtr[i] = (i < actualLen) ? 1 : 0;
+        }
+
+        // Forward through text encoder module
+        auto outs = mModules[0]->onForward({idsVar, maskVar});
+        if (outs.empty()) { MNN_PRINT("[Flux2Klein] Text encoder forward failed\n"); return nullptr; }
+
+        // Output: prompt_embeds [1, seqLen, hiddenSize]
+        auto embeds = _Convert(outs[0], NCHW);
+        embeds.fix(VARP::CONSTANT);
+        auto fi = embeds->getInfo();
+        MNN_PRINT("[Flux2Klein] Text embeds: [%d,%d,%d]\n", fi->dim[0], fi->dim[1], fi->dim[2]);
+        return embeds;
+    } catch (const std::exception& e) {
+        MNN_ERROR("[Flux2Klein] Exception in text_encoder_llm: %s\n", e.what());
+        return nullptr;
+    } catch (...) {
+        MNN_ERROR("[Flux2Klein] Unknown exception in text_encoder_llm\n");
+        return nullptr;
     }
-
-    int actualLen = (int)inputIds.size();
-    // Truncate if needed
-    if (actualLen > mTextSeqLen) {
-        inputIds.resize(mTextSeqLen);
-        actualLen = mTextSeqLen;
-    }
-    // Pad to mTextSeqLen (matching Python: padding='max_length', max_length=512)
-    // padding token id = 0, attention_mask = 0 for padding positions
-    int seqLen = mTextSeqLen;
-    inputIds.resize(seqLen, 0);
-
-    // Build input_ids [1, seqLen] and attention_mask [1, seqLen]
-    INTS idShape = {1, seqLen};
-    auto idsVar  = _Input(idShape, NCHW, halide_type_of<int>());
-    auto maskVar = _Input(idShape, NCHW, halide_type_of<int>());
-    auto idsPtr  = idsVar->writeMap<int>();
-    auto maskPtr = maskVar->writeMap<int>();
-    for (int i = 0; i < seqLen; ++i) {
-        idsPtr[i]  = inputIds[i];
-        maskPtr[i] = (i < actualLen) ? 1 : 0;
-    }
-
-    // Forward through text encoder module
-    auto outs = mModules[0]->onForward({idsVar, maskVar});
-    if (outs.empty()) { MNN_PRINT("[Flux2Klein] Text encoder forward failed\n"); return nullptr; }
-
-    // Output: prompt_embeds [1, seqLen, hiddenSize]
-    auto embeds = _Convert(outs[0], NCHW);
-    embeds.fix(VARP::CONSTANT);
-    auto fi = embeds->getInfo();
-    MNN_PRINT("[Flux2Klein] Text embeds: [%d,%d,%d]\n", fi->dim[0], fi->dim[1], fi->dim[2]);
-    return embeds;
 }
 
 // ===== VAE Decoder =====
 VARP Flux2KleinDiffusion::vae_decoder(VARP latent) {
-    if (mMemoryMode != 1) {
-        mModules[1].reset();
-        MNN_PRINT("[Flux2Klein] Transformer unloaded\n");
+    try {
+        if (mMemoryMode != 1) {
+            mModules[1].reset();
+            MNN_PRINT("[Flux2Klein] Transformer unloaded\n");
+        }
+        // Lazy load VAE decoder on demand
+        if (!mModules[2]) {
+            Module::Config mc; mc.shapeMutable = true;
+            auto path = mDiffConfig->vae_decoder_model();
+            MNN_PRINT("[Flux2Klein] Load VAE decoder on demand: %s\n", path.c_str());
+            auto& vae_runtime = runtime_manager_vae_cpu_ ? runtime_manager_vae_cpu_ : runtime_manager_;
+            mModules[2].reset(Module::load({"latent_sample"},{"sample"}, path.c_str(), vae_runtime, &mc));
+            if (mModules[2]) mModules[2]->traceOrOptimize(MNN::Interpreter::Session_Resize_Fix);
+            if (!mModules[2]) { MNN_PRINT("[Flux2Klein] Failed to load VAE decoder\n"); return nullptr; }
+        }
+        AUTOTIME;
+        auto outs = mModules[2]->onForward({latent});
+        if (outs.empty()) { MNN_PRINT("[Flux2Klein] VAE decode failed\n"); return nullptr; }
+        return nchwFloatToHwcBGR(_Convert(outs[0], NCHW));
+    } catch (const std::exception& e) {
+        MNN_ERROR("[Flux2Klein] Exception in vae_decoder: %s\n", e.what());
+        return nullptr;
+    } catch (...) {
+        MNN_ERROR("[Flux2Klein] Unknown exception in vae_decoder\n");
+        return nullptr;
     }
-    // Lazy load VAE decoder on demand
-    if (!mModules[2]) {
-        Module::Config mc; mc.shapeMutable = true;
-        auto path = mDiffConfig->vae_decoder_model();
-        MNN_PRINT("[Flux2Klein] Load VAE decoder on demand: %s\n", path.c_str());
-        auto& vae_runtime = runtime_manager_vae_cpu_ ? runtime_manager_vae_cpu_ : runtime_manager_;
-        mModules[2].reset(Module::load({"latent_sample"},{"sample"}, path.c_str(), vae_runtime, &mc));
-        if (mModules[2]) mModules[2]->traceOrOptimize(MNN::Interpreter::Session_Resize_Fix);
-        if (!mModules[2]) { MNN_PRINT("[Flux2Klein] Failed to load VAE decoder\n"); return nullptr; }
-    }
-    AUTOTIME;
-    auto outs = mModules[2]->onForward({latent});
-    if (outs.empty()) { MNN_PRINT("[Flux2Klein] VAE decode failed\n"); return nullptr; }
-    return nchwFloatToHwcBGR(_Convert(outs[0], NCHW));
 }
 
 // ===== VAE Encoder =====
@@ -329,59 +353,67 @@ VARP Flux2KleinDiffusion::vae_decoder(VARP latent) {
 //   2. _patchify_latents -> [1, 128, H/16, W/16]  (H/8 / 2 = H/16)
 //   3. BN normalize: (x - bn_mean) / bn_std
 VARP Flux2KleinDiffusion::vae_encoder(VARP image) {
-    // Lazy load VAE encoder on demand
-    if (!mModules[3]) {
-        Module::Config mc; mc.shapeMutable = true;
-        auto path = mDiffConfig->vae_encoder_model();
-        MNN_PRINT("[Flux2Klein] Load VAE encoder on demand: %s\n", path.c_str());
-        auto& vae_runtime = runtime_manager_vae_cpu_ ? runtime_manager_vae_cpu_ : runtime_manager_;
-        mModules[3].reset(Module::load({"sample"},{"latent_sample"}, path.c_str(), vae_runtime, &mc));
-        if (mModules[3]) mModules[3]->traceOrOptimize(MNN::Interpreter::Session_Resize_Fix);
-        if (!mModules[3]) { MNN_PRINT("[Flux2Klein] Failed to load VAE encoder\n"); return nullptr; }
-    }
-    AUTOTIME;
-    auto outs = mModules[3]->onForward({image});
-    if (outs.empty()) { MNN_PRINT("[Flux2Klein] VAE encode failed\n"); return nullptr; }
-    auto lat = _Convert(outs[0], NCHW);  // [1, 32, H/8, W/8]
-    lat.fix(VARP::CONSTANT);
+    try {
+        // Lazy load VAE encoder on demand
+        if (!mModules[3]) {
+            Module::Config mc; mc.shapeMutable = true;
+            auto path = mDiffConfig->vae_encoder_model();
+            MNN_PRINT("[Flux2Klein] Load VAE encoder on demand: %s\n", path.c_str());
+            auto& vae_runtime = runtime_manager_vae_cpu_ ? runtime_manager_vae_cpu_ : runtime_manager_;
+            mModules[3].reset(Module::load({"sample"},{"latent_sample"}, path.c_str(), vae_runtime, &mc));
+            if (mModules[3]) mModules[3]->traceOrOptimize(MNN::Interpreter::Session_Resize_Fix);
+            if (!mModules[3]) { MNN_PRINT("[Flux2Klein] Failed to load VAE encoder\n"); return nullptr; }
+        }
+        AUTOTIME;
+        auto outs = mModules[3]->onForward({image});
+        if (outs.empty()) { MNN_PRINT("[Flux2Klein] VAE encode failed\n"); return nullptr; }
+        auto lat = _Convert(outs[0], NCHW);  // [1, 32, H/8, W/8]
+        lat.fix(VARP::CONSTANT);
 
-    // Patchify: [1,32,H,W] -> [1,128,H/2,W/2]
-    auto info = lat->getInfo();
-    int B = info->dim[0], C = info->dim[1], H = info->dim[2], W = info->dim[3];
-    int pH = H/2, pW = W/2, pC = C*4;
-    std::vector<float> patchData(B * pC * pH * pW);
-    const float* src = lat->readMap<float>();
-    // _patchify_latents: view(B,C,H/2,2,W/2,2).permute(0,1,3,5,2,4).reshape(B,C*4,H/2,W/2)
-    // Result channel index: c*4 + dh*2 + dw
-    for (int b = 0; b < B; ++b)
-        for (int c = 0; c < C; ++c)
-            for (int ph = 0; ph < pH; ++ph)
-                for (int pw = 0; pw < pW; ++pw)
-                    for (int dh = 0; dh < 2; ++dh)
-                        for (int dw = 0; dw < 2; ++dw) {
-                            int srcIdx = b*C*H*W + c*H*W + (ph*2+dh)*W + (pw*2+dw);
-                            int fc = c*4 + dh*2 + dw;
-                            int dstIdx = b*pC*pH*pW + fc*pH*pW + ph*pW + pw;
-                            patchData[dstIdx] = src[srcIdx];
-                        }
-
-    // BN normalize: (x - bn_mean) / bn_std  (per-channel, broadcast over H,W)
-    if ((int)mVaeBnMean.size() == pC && (int)mVaeBnStd.size() == pC) {
+        // Patchify: [1,32,H,W] -> [1,128,H/2,W/2]
+        auto info = lat->getInfo();
+        int B = info->dim[0], C = info->dim[1], H = info->dim[2], W = info->dim[3];
+        int pH = H/2, pW = W/2, pC = C*4;
+        std::vector<float> patchData(B * pC * pH * pW);
+        const float* src = lat->readMap<float>();
+        // _patchify_latents: view(B,C,H/2,2,W/2,2).permute(0,1,3,5,2,4).reshape(B,C*4,H/2,W/2)
+        // Result channel index: c*4 + dh*2 + dw
         for (int b = 0; b < B; ++b)
-            for (int c = 0; c < pC; ++c) {
-                float mean = mVaeBnMean[c], bnStd = mVaeBnStd[c];
-                for (int i = 0; i < pH*pW; ++i)
-                    patchData[b*pC*pH*pW + c*pH*pW + i] = (patchData[b*pC*pH*pW + c*pH*pW + i] - mean) / bnStd;
-            }
-    } else {
-        MNN_PRINT("[Flux2Klein] Warning: BN params missing, skipping BN normalize\n");
-    }
+            for (int c = 0; c < C; ++c)
+                for (int ph = 0; ph < pH; ++ph)
+                    for (int pw = 0; pw < pW; ++pw)
+                        for (int dh = 0; dh < 2; ++dh)
+                            for (int dw = 0; dw < 2; ++dw) {
+                                int srcIdx = b*C*H*W + c*H*W + (ph*2+dh)*W + (pw*2+dw);
+                                int fc = c*4 + dh*2 + dw;
+                                int dstIdx = b*pC*pH*pW + fc*pH*pW + ph*pW + pw;
+                                patchData[dstIdx] = src[srcIdx];
+                            }
 
-    auto patchVar = _Input({B, pC, pH, pW}, NCHW, halide_type_of<float>());
-    memcpy(patchVar->writeMap<float>(), patchData.data(), patchData.size()*sizeof(float));
-    patchVar.fix(VARP::CONSTANT);
-    MNN_PRINT("[Flux2Klein] VAE encoded+patchified: [%d,%d,%d,%d]\n", B, pC, pH, pW);
-    return patchVar;
+        // BN normalize: (x - bn_mean) / bn_std  (per-channel, broadcast over H,W)
+        if ((int)mVaeBnMean.size() == pC && (int)mVaeBnStd.size() == pC) {
+            for (int b = 0; b < B; ++b)
+                for (int c = 0; c < pC; ++c) {
+                    float mean = mVaeBnMean[c], bnStd = mVaeBnStd[c];
+                    for (int i = 0; i < pH*pW; ++i)
+                        patchData[b*pC*pH*pW + c*pH*pW + i] = (patchData[b*pC*pH*pW + c*pH*pW + i] - mean) / bnStd;
+                }
+        } else {
+            MNN_PRINT("[Flux2Klein] Warning: BN params missing, skipping BN normalize\n");
+        }
+
+        auto patchVar = _Input({B, pC, pH, pW}, NCHW, halide_type_of<float>());
+        memcpy(patchVar->writeMap<float>(), patchData.data(), patchData.size()*sizeof(float));
+        patchVar.fix(VARP::CONSTANT);
+        MNN_PRINT("[Flux2Klein] VAE encoded+patchified: [%d,%d,%d,%d]\n", B, pC, pH, pW);
+        return patchVar;
+    } catch (const std::exception& e) {
+        MNN_ERROR("[Flux2Klein] Exception in vae_encoder: %s\n", e.what());
+        return nullptr;
+    } catch (...) {
+        MNN_ERROR("[Flux2Klein] Unknown exception in vae_encoder\n");
+        return nullptr;
+    }
 }
 
 
@@ -389,170 +421,178 @@ VARP Flux2KleinDiffusion::vae_encoder(VARP image) {
 VARP Flux2KleinDiffusion::unet(VARP textEmbeds, VARP imageLatents,
                                 int iterNum, int randomSeed,
                                 std::function<void(int)> progressCallback) {
-    // Free tokenizer to save memory before denoising
+    try {
+        // Free tokenizer to save memory before denoising
 #ifdef MNN_BUILD_LLM
-    if (mMemoryMode != 1 && mTokenizer) {
-        mTokenizer.reset();
-        MNN_PRINT("[Flux2Klein] Tokenizer unloaded\n");
-    }
+        if (mMemoryMode != 1 && mTokenizer) {
+            mTokenizer.reset();
+            MNN_PRINT("[Flux2Klein] Tokenizer unloaded\n");
+        }
 #endif
-    // Copy textEmbeds to independent CPU tensor before freeing text encoder.
-    // textEmbeds VARP may reference memory owned by mModules[0]; reset() frees it.
-    if (mMemoryMode != 1 && textEmbeds.get()) {
-        auto info = textEmbeds->getInfo();
-        if (info) {
-            size_t n = 1; for (auto d : info->dim) n *= d;
-            std::vector<float> buf(n);
-            const float* src = textEmbeds->readMap<float>();
-            if (src) memcpy(buf.data(), src, n * sizeof(float));
-            VARP tmp = _Input(info->dim, info->order, halide_type_of<float>());
-            memcpy(tmp->writeMap<float>(), buf.data(), n * sizeof(float));
-            tmp.fix(VARP::CONSTANT);
-            textEmbeds = tmp;
+        // Copy textEmbeds to independent CPU tensor before freeing text encoder.
+        // textEmbeds VARP may reference memory owned by mModules[0]; reset() frees it.
+        if (mMemoryMode != 1 && textEmbeds.get()) {
+            auto info = textEmbeds->getInfo();
+            if (info) {
+                size_t n = 1; for (auto d : info->dim) n *= d;
+                std::vector<float> buf(n);
+                const float* src = textEmbeds->readMap<float>();
+                if (src) memcpy(buf.data(), src, n * sizeof(float));
+                VARP tmp = _Input(info->dim, info->order, halide_type_of<float>());
+                memcpy(tmp->writeMap<float>(), buf.data(), n * sizeof(float));
+                tmp.fix(VARP::CONSTANT);
+                textEmbeds = tmp;
+            }
+            mModules[0].reset();
+            MNN_PRINT("[Flux2Klein] Text encoder unloaded\n");
         }
-        mModules[0].reset();
-        MNN_PRINT("[Flux2Klein] Text encoder unloaded\n");
-    }
-    // Lazy load transformer on demand
-    if (!mModules[1]) {
-        Module::Config mc; mc.shapeMutable = true;
-        auto path = mDiffConfig->unet_model();
-        MNN_PRINT("[Flux2Klein] Load transformer on demand: %s\n", path.c_str());
-        mModules[1].reset(Module::load(
-            {"hidden_states","timestep","encoder_hidden_states","txt_ids","img_ids"},
-            {"output"}, path.c_str(), runtime_manager_, &mc));
-        if (!mModules[1]) { MNN_PRINT("[Flux2Klein] Failed to load transformer\n"); return nullptr; }
-    }
-    bool isT2I = !imageLatents.get();
-    int pH = mLatentH/2, pW = mLatentW/2;
-    int singleSeq = pH * pW;
-    int imgSeqLen = isT2I ? singleSeq : singleSeq * 2;
-    int pC = mPackedC;  // 128
+        // Lazy load transformer on demand
+        if (!mModules[1]) {
+            Module::Config mc; mc.shapeMutable = true;
+            auto path = mDiffConfig->unet_model();
+            MNN_PRINT("[Flux2Klein] Load transformer on demand: %s\n", path.c_str());
+            mModules[1].reset(Module::load(
+                {"hidden_states","timestep","encoder_hidden_states","txt_ids","img_ids"},
+                {"output"}, path.c_str(), runtime_manager_, &mc));
+            if (!mModules[1]) { MNN_PRINT("[Flux2Klein] Failed to load transformer\n"); return nullptr; }
+        }
+        bool isT2I = !imageLatents.get();
+        int pH = mLatentH/2, pW = mLatentW/2;
+        int singleSeq = pH * pW;
+        int imgSeqLen = isT2I ? singleSeq : singleSeq * 2;
+        int pC = mPackedC;  // 128
 
-    MNN_PRINT("[Flux2Klein] %s: singleSeq=%d imgSeqLen=%d textSeqLen=%d\n",
-              isT2I ? "T2I" : "Edit", singleSeq, imgSeqLen, mTextSeqLen);
+        MNN_PRINT("[Flux2Klein] %s: singleSeq=%d imgSeqLen=%d textSeqLen=%d\n",
+                  isT2I ? "T2I" : "Edit", singleSeq, imgSeqLen, mTextSeqLen);
 
-    // Generate noise [B,C,H,W] with PhiloxRNG (aligned with PyTorch)
-    int latentSize = mLatentC * mLatentH * mLatentW;
-    std::vector<float> noiseData(latentSize);
-    {
-        int seed = randomSeed < 0 ? std::random_device()() : randomSeed;
-        generateLatentNoise(noiseData.data(), latentSize, seed);
-    }
+        // Generate noise [B,C,H,W] with PhiloxRNG (aligned with PyTorch)
+        int latentSize = mLatentC * mLatentH * mLatentW;
+        std::vector<float> noiseData(latentSize);
+        {
+            int seed = randomSeed < 0 ? std::random_device()() : randomSeed;
+            generateLatentNoise(noiseData.data(), latentSize, seed);
+        }
 
-    // Compute sigmas
-    auto sigmas = getSigmas(iterNum, singleSeq);
+        // Compute sigmas
+        auto sigmas = getSigmas(iterNum, singleSeq);
 
-    // Prepare txt_ids [1, textSeqLen, 4] - batch dim included
-    // Use actual text embed seq len (not mTextSeqLen)
-    int txtSeqLen = textEmbeds->getInfo()->dim[1];
-    std::vector<float> txtIdsData(txtSeqLen * ID_DIM, 0.f);
-    prepareTxtIds(txtIdsData.data(), txtSeqLen);
+        // Prepare txt_ids [1, textSeqLen, 4] - batch dim included
+        // Use actual text embed seq len (not mTextSeqLen)
+        int txtSeqLen = textEmbeds->getInfo()->dim[1];
+        std::vector<float> txtIdsData(txtSeqLen * ID_DIM, 0.f);
+        prepareTxtIds(txtIdsData.data(), txtSeqLen);
 
-    // Prepare img_ids [1, imgSeqLen, 4] - batch dim included
-    std::vector<float> imgIdsData(imgSeqLen * ID_DIM, 0.f);
-    // Noise latent ids: t=0 (matches _prepare_latent_ids)
-    prepareImgIds(imgIdsData.data(), mLatentH, mLatentW, 0, 0.f);
-    if (!isT2I) {
-        // Image latent ids: t=IMAGE_LATENT_T_OFFSET=10 (matches _prepare_image_ids, scale=10, first image)
-        prepareImgIds(imgIdsData.data(), mLatentH, mLatentW, singleSeq, (float)Flux2KleinDiffusion::IMAGE_LATENT_T_OFFSET);
-    }
-
-    // Pre-pack image latents for editing
-    // vae_encoder returns patchified+BN-normalized [1, 128, pH, pW] (pH=H/16, pW=W/16)
-    // _pack_latents: [B, C, H, W] -> reshape(B, C, H*W).permute(0,2,1) -> [B, H*W, C]
-    std::vector<float> imageLatentsPacked;
-    if (!isT2I) {
-        auto imgInfo = imageLatents->getInfo();
-        int iB = imgInfo->dim[0], iC = imgInfo->dim[1], iH = imgInfo->dim[2], iW = imgInfo->dim[3];
-        int imgSeq = iH * iW;
-        MNN_ASSERT(imgSeq == singleSeq && iC == pC);
-        imageLatentsPacked.resize(singleSeq * pC);
-        const float* imgSrc = imageLatents->readMap<float>();
-        // [1, pC, pH, pW] -> [pH*pW, pC]  (permute C and HW)
-        for (int c = 0; c < pC; ++c)
-            for (int i = 0; i < singleSeq; ++i)
-                imageLatentsPacked[i * pC + c] = imgSrc[c * singleSeq + i];
-    }
-
-    // Pack noise latents: [B,C,H,W] -> [singleSeq, pC]
-    std::vector<float> latentSeq(singleSeq * pC);
-    packLatentsToSeq(noiseData.data(), latentSeq.data(), 1, mLatentC, mLatentH, mLatentW);
-
-    // Allocate transformer inputs - ids shape [1, seq, 4] with batch dim
-    INTS txtIdsShape = {1, txtSeqLen, ID_DIM};
-    auto txtIdsVar = _Input(txtIdsShape, NCHW, halide_type_of<float>());
-    memcpy(txtIdsVar->writeMap<float>(), txtIdsData.data(), txtIdsData.size()*sizeof(float));
-
-    INTS imgIdsShape = {1, imgSeqLen, ID_DIM};
-    auto imgIdsVar = _Input(imgIdsShape, NCHW, halide_type_of<float>());
-    memcpy(imgIdsVar->writeMap<float>(), imgIdsData.data(), imgIdsData.size()*sizeof(float));
-
-    // Current latent state [1, singleSeq, pC]
-    std::vector<float> curLatent = latentSeq;
-
-    MNN_PRINT("[Flux2Klein] Denoising %d steps, sigma[0]=%.4f sigma[-1]=%.4f\n",
-              iterNum, sigmas[0], sigmas[iterNum-1]);
-
-    for (int i = 0; i < iterNum; ++i) {
-        AUTOTIME;
-        float sigma      = sigmas[i];
-        float sigma_next = sigmas[i + 1];
-        float dt         = sigma_next - sigma;
-
-        // Build sample input [1, imgSeqLen, pC]
-        std::vector<float> sampleData(imgSeqLen * pC);
-        memcpy(sampleData.data(), curLatent.data(), singleSeq * pC * sizeof(float));
+        // Prepare img_ids [1, imgSeqLen, 4] - batch dim included
+        std::vector<float> imgIdsData(imgSeqLen * ID_DIM, 0.f);
+        // Noise latent ids: t=0 (matches _prepare_latent_ids)
+        prepareImgIds(imgIdsData.data(), mLatentH, mLatentW, 0, 0.f);
         if (!isT2I) {
-            memcpy(sampleData.data() + singleSeq * pC,
-                   imageLatentsPacked.data(), singleSeq * pC * sizeof(float));
+            // Image latent ids: t=IMAGE_LATENT_T_OFFSET=10 (matches _prepare_image_ids, scale=10, first image)
+            prepareImgIds(imgIdsData.data(), mLatentH, mLatentW, singleSeq, (float)Flux2KleinDiffusion::IMAGE_LATENT_T_OFFSET);
         }
 
-        auto sampleVar   = _Input({1, imgSeqLen, pC}, NCHW, halide_type_of<float>());
-        auto timestepVar = _Input({1}, NCHW, halide_type_of<float>());
-        memcpy(sampleVar->writeMap<float>(), sampleData.data(), sampleData.size()*sizeof(float));
-        timestepVar->writeMap<float>()[0] = sigma;  // transformer expects sigma in [0,1]
-
-        std::vector<VARP> inputs = {sampleVar, timestepVar, textEmbeds, txtIdsVar, imgIdsVar};
-        auto outs = mModules[1]->onForward(inputs);
-        if (outs.empty()) {
-            MNN_PRINT("[Flux2Klein] Transformer failed at step %d\n", i);
-            return nullptr;
-        }
-        auto noisePred = _Convert(outs[0], NCHW);  // [1, imgSeqLen, pC]
-
-        // For editing: take only first singleSeq tokens
+        // Pre-pack image latents for editing
+        // vae_encoder returns patchified+BN-normalized [1, 128, pH, pW] (pH=H/16, pW=W/16)
+        // _pack_latents: [B, C, H, W] -> reshape(B, C, H*W).permute(0,2,1) -> [B, H*W, C]
+        std::vector<float> imageLatentsPacked;
         if (!isT2I) {
-            std::vector<int> starts = {0, 0, 0};
-            std::vector<int> sizes  = {1, singleSeq, pC};
-            noisePred = _Slice(noisePred,
-                _Const(starts.data(),{3},NCHW,halide_type_of<int>()),
-                _Const(sizes.data(), {3},NCHW,halide_type_of<int>()));
+            auto imgInfo = imageLatents->getInfo();
+            int iB = imgInfo->dim[0], iC = imgInfo->dim[1], iH = imgInfo->dim[2], iW = imgInfo->dim[3];
+            int imgSeq = iH * iW;
+            MNN_ASSERT(imgSeq == singleSeq && iC == pC);
+            imageLatentsPacked.resize(singleSeq * pC);
+            const float* imgSrc = imageLatents->readMap<float>();
+            // [1, pC, pH, pW] -> [pH*pW, pC]  (permute C and HW)
+            for (int c = 0; c < pC; ++c)
+                for (int i = 0; i < singleSeq; ++i)
+                    imageLatentsPacked[i * pC + c] = imgSrc[c * singleSeq + i];
         }
-        noisePred.fix(VARP::CONSTANT);
 
-        // Euler update: latent = latent + dt * noise_pred
-        const float* npPtr = noisePred->readMap<float>();
-        for (int j = 0; j < singleSeq * pC; ++j)
-            curLatent[j] += dt * npPtr[j];
+        // Pack noise latents: [B,C,H,W] -> [singleSeq, pC]
+        std::vector<float> latentSeq(singleSeq * pC);
+        packLatentsToSeq(noiseData.data(), latentSeq.data(), 1, mLatentC, mLatentH, mLatentW);
 
-        if (mBackendType == MNN_FORWARD_OPENCL)
-            MNN::Express::ExecutorScope::Current()->gc(MNN::Express::Executor::PART);
+        // Allocate transformer inputs - ids shape [1, seq, 4] with batch dim
+        INTS txtIdsShape = {1, txtSeqLen, ID_DIM};
+        auto txtIdsVar = _Input(txtIdsShape, NCHW, halide_type_of<float>());
+        memcpy(txtIdsVar->writeMap<float>(), txtIdsData.data(), txtIdsData.size()*sizeof(float));
 
-        if (progressCallback) progressCallback((2 + i) * 100 / (iterNum + 3));
-        MNN_PRINT("[Flux2Klein] Step %d/%d sigma=%.4f\n", i+1, iterNum, sigma);
+        INTS imgIdsShape = {1, imgSeqLen, ID_DIM};
+        auto imgIdsVar = _Input(imgIdsShape, NCHW, halide_type_of<float>());
+        memcpy(imgIdsVar->writeMap<float>(), imgIdsData.data(), imgIdsData.size()*sizeof(float));
+
+        // Current latent state [1, singleSeq, pC]
+        std::vector<float> curLatent = latentSeq;
+
+        MNN_PRINT("[Flux2Klein] Denoising %d steps, sigma[0]=%.4f sigma[-1]=%.4f\n",
+                  iterNum, sigmas[0], sigmas[iterNum-1]);
+
+        for (int i = 0; i < iterNum; ++i) {
+            AUTOTIME;
+            float sigma      = sigmas[i];
+            float sigma_next = sigmas[i + 1];
+            float dt         = sigma_next - sigma;
+
+            // Build sample input [1, imgSeqLen, pC]
+            std::vector<float> sampleData(imgSeqLen * pC);
+            memcpy(sampleData.data(), curLatent.data(), singleSeq * pC * sizeof(float));
+            if (!isT2I) {
+                memcpy(sampleData.data() + singleSeq * pC,
+                       imageLatentsPacked.data(), singleSeq * pC * sizeof(float));
+            }
+
+            auto sampleVar   = _Input({1, imgSeqLen, pC}, NCHW, halide_type_of<float>());
+            auto timestepVar = _Input({1}, NCHW, halide_type_of<float>());
+            memcpy(sampleVar->writeMap<float>(), sampleData.data(), sampleData.size()*sizeof(float));
+            timestepVar->writeMap<float>()[0] = sigma;  // transformer expects sigma in [0,1]
+
+            std::vector<VARP> inputs = {sampleVar, timestepVar, textEmbeds, txtIdsVar, imgIdsVar};
+            auto outs = mModules[1]->onForward(inputs);
+            if (outs.empty()) {
+                MNN_PRINT("[Flux2Klein] Transformer failed at step %d\n", i);
+                return nullptr;
+            }
+            auto noisePred = _Convert(outs[0], NCHW);  // [1, imgSeqLen, pC]
+
+            // For editing: take only first singleSeq tokens
+            if (!isT2I) {
+                std::vector<int> starts = {0, 0, 0};
+                std::vector<int> sizes  = {1, singleSeq, pC};
+                noisePred = _Slice(noisePred,
+                    _Const(starts.data(),{3},NCHW,halide_type_of<int>()),
+                    _Const(sizes.data(), {3},NCHW,halide_type_of<int>()));
+            }
+            noisePred.fix(VARP::CONSTANT);
+
+            // Euler update: latent = latent + dt * noise_pred
+            const float* npPtr = noisePred->readMap<float>();
+            for (int j = 0; j < singleSeq * pC; ++j)
+                curLatent[j] += dt * npPtr[j];
+
+            if (mBackendType == MNN_FORWARD_OPENCL)
+                MNN::Express::ExecutorScope::Current()->gc(MNN::Express::Executor::PART);
+
+            if (progressCallback) progressCallback((2 + i) * 100 / (iterNum + 3));
+            MNN_PRINT("[Flux2Klein] Step %d/%d sigma=%.4f\n", i+1, iterNum, sigma);
+        }
+
+        // Unpack: [singleSeq, pC] -> [1, pC, pH, pW]  (normalized patchified for VAE)
+        int pH2 = mLatentH/2, pW2 = mLatentW/2;
+        std::vector<float> patchifiedData(pC * pH2 * pW2);
+        unpackLatentsToPatchified(curLatent.data(), patchifiedData.data(),
+                                  1, mLatentC, mLatentH, mLatentW, singleSeq);
+
+        auto patchifiedVar = _Input({1, pC, pH2, pW2}, NCHW, halide_type_of<float>());
+        memcpy(patchifiedVar->writeMap<float>(), patchifiedData.data(), patchifiedData.size()*sizeof(float));
+        patchifiedVar.fix(VARP::CONSTANT);
+        return patchifiedVar;
+    } catch (const std::exception& e) {
+        MNN_ERROR("[Flux2Klein] Exception in unet: %s\n", e.what());
+        return nullptr;
+    } catch (...) {
+        MNN_ERROR("[Flux2Klein] Unknown exception in unet\n");
+        return nullptr;
     }
-
-    // Unpack: [singleSeq, pC] -> [1, pC, pH, pW]  (normalized patchified for VAE)
-    int pH2 = mLatentH/2, pW2 = mLatentW/2;
-    std::vector<float> patchifiedData(pC * pH2 * pW2);
-    unpackLatentsToPatchified(curLatent.data(), patchifiedData.data(),
-                              1, mLatentC, mLatentH, mLatentW, singleSeq);
-
-    auto patchifiedVar = _Input({1, pC, pH2, pW2}, NCHW, halide_type_of<float>());
-    memcpy(patchifiedVar->writeMap<float>(), patchifiedData.data(), patchifiedData.size()*sizeof(float));
-    patchifiedVar.fix(VARP::CONSTANT);
-    return patchifiedVar;
 }
 
 
@@ -567,64 +607,72 @@ bool Flux2KleinDiffusion::run(const std::string prompt, const std::string output
                                int iterNum, int randomSeed, float cfgScale,
                                std::function<void(int)> progressCallback,
                                const std::string inputImagePath) {
-    AUTOTIME;
-    bool isT2I = inputImagePath.empty();
-    VARP imageLatents = nullptr;
+    try {
+        AUTOTIME;
+        bool isT2I = inputImagePath.empty();
+        VARP imageLatents = nullptr;
 
-    if (!isT2I) {
-        MNN_PRINT("[Flux2Klein] Image Edit: %s\n", inputImagePath.c_str());
-        auto rawImage = CV::imread(inputImagePath);
-        if (!rawImage.get()) {
-            MNN_PRINT("[Flux2Klein] Error: cannot load %s\n", inputImagePath.c_str());
-            return false;
-        }
-        auto processed = resizeAndCenterCrop(rawImage, mImageWidth, mImageHeight);
-        auto rgbImage  = bgrToRgb(processed);
-        auto inputNorm = hwcToNchw(rgbImage, true);  // normalize to [-1,1]
-        imageLatents = vae_encoder(inputNorm);
-        if (!imageLatents.get()) { MNN_PRINT("[Flux2Klein] VAE encode failed\n"); return false; }
-        // Copy imageLatents to independent CPU tensor before freeing VAE encoder.
-        // imageLatents VARP may reference memory owned by mModules[3]; reset() frees it.
-        {
-            auto info = imageLatents->getInfo();
-            if (info) {
-                size_t n = 1; for (auto d : info->dim) n *= d;
-                std::vector<float> buf(n);
-                const float* src = imageLatents->readMap<float>();
-                if (src) memcpy(buf.data(), src, n * sizeof(float));
-                VARP tmp = _Input(info->dim, info->order, halide_type_of<float>());
-                memcpy(tmp->writeMap<float>(), buf.data(), n * sizeof(float));
-                tmp.fix(VARP::CONSTANT);
-                imageLatents = tmp;
+        if (!isT2I) {
+            MNN_PRINT("[Flux2Klein] Image Edit: %s\n", inputImagePath.c_str());
+            auto rawImage = CV::imread(inputImagePath);
+            if (!rawImage.get()) {
+                MNN_PRINT("[Flux2Klein] Error: cannot load %s\n", inputImagePath.c_str());
+                return false;
             }
+            auto processed = resizeAndCenterCrop(rawImage, mImageWidth, mImageHeight);
+            auto rgbImage  = bgrToRgb(processed);
+            auto inputNorm = hwcToNchw(rgbImage, true);  // normalize to [-1,1]
+            imageLatents = vae_encoder(inputNorm);
+            if (!imageLatents.get()) { MNN_PRINT("[Flux2Klein] VAE encode failed\n"); return false; }
+            // Copy imageLatents to independent CPU tensor before freeing VAE encoder.
+            // imageLatents VARP may reference memory owned by mModules[3]; reset() frees it.
+            {
+                auto info = imageLatents->getInfo();
+                if (info) {
+                    size_t n = 1; for (auto d : info->dim) n *= d;
+                    std::vector<float> buf(n);
+                    const float* src = imageLatents->readMap<float>();
+                    if (src) memcpy(buf.data(), src, n * sizeof(float));
+                    VARP tmp = _Input(info->dim, info->order, halide_type_of<float>());
+                    memcpy(tmp->writeMap<float>(), buf.data(), n * sizeof(float));
+                    tmp.fix(VARP::CONSTANT);
+                    imageLatents = tmp;
+                }
+            }
+            if (mMemoryMode != 1) mModules[3].reset();
         }
-        if (mMemoryMode != 1) mModules[3].reset();
+
+        if (iterNum < 1)  iterNum = 8;
+        if (iterNum > 50) iterNum = 50;
+
+        if (progressCallback) progressCallback(0);
+
+        auto textEmbeds = text_encoder_llm(prompt);
+        if (!textEmbeds.get()) { MNN_PRINT("[Flux2Klein] Text encode failed\n"); return false; }
+        if (progressCallback) progressCallback(1 * 100 / (iterNum + 3));
+        auto latent = unet(textEmbeds, imageLatents, iterNum, randomSeed, progressCallback);
+        if (!latent.get()) { MNN_PRINT("[Flux2Klein] UNet failed\n"); return false; }
+
+        auto image = vae_decoder(latent);
+        if (!image.get()) { MNN_PRINT("[Flux2Klein] VAE decode failed\n"); return false; }
+
+        bool res = CV::imwrite(outputPath, image);
+        if (res) MNN_PRINT("[Flux2Klein] Saved: %s\n", outputPath.c_str());
+        else     MNN_PRINT("[Flux2Klein] Error: imwrite failed: %s\n", outputPath.c_str());
+
+        if (mMemoryMode != 1) {
+            mModules[2].reset();
+            MNN_PRINT("[Flux2Klein] VAE decoder unloaded\n");
+        }
+        if (progressCallback) progressCallback(100);
+        return res;
+    } catch (const std::exception& e) {
+        MNN_ERROR("[Flux2Klein] Exception in run: %s\n", e.what());
+        return false;
+    } catch (...) {
+        MNN_ERROR("[Flux2Klein] Unknown exception in run\n");
+        return false;
     }
-
-    if (iterNum < 1)  iterNum = 8;
-    if (iterNum > 50) iterNum = 50;
-
-    if (progressCallback) progressCallback(0);
-
-    auto textEmbeds = text_encoder_llm(prompt);
-    if (!textEmbeds.get()) { MNN_PRINT("[Flux2Klein] Text encode failed\n"); return false; }
-    if (progressCallback) progressCallback(1 * 100 / (iterNum + 3));
-    auto latent = unet(textEmbeds, imageLatents, iterNum, randomSeed, progressCallback);
-    if (!latent.get()) { MNN_PRINT("[Flux2Klein] UNet failed\n"); return false; }
-
-    auto image = vae_decoder(latent);
-    if (!image.get()) { MNN_PRINT("[Flux2Klein] VAE decode failed\n"); return false; }
-
-    bool res = CV::imwrite(outputPath, image);
-    if (res) MNN_PRINT("[Flux2Klein] Saved: %s\n", outputPath.c_str());
-    else     MNN_PRINT("[Flux2Klein] Error: imwrite failed: %s\n", outputPath.c_str());
-
-    if (mMemoryMode != 1) {
-        mModules[2].reset();
-        MNN_PRINT("[Flux2Klein] VAE decoder unloaded\n");
-    }
-    if (progressCallback) progressCallback(100);
-    return res;
 }
 
 bool Flux2KleinDiffusion::run(const VARP input_embeds, const std::string& mode,
