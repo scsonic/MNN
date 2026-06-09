@@ -202,9 +202,15 @@ VULKAN_TENSOR VulkanBackend::getBuffer(const Tensor* tensor) const {
     return std::make_tuple(b.first->buffer(), getTensorSize(tensor), b.second);
 }
 
+#include <stdexcept>
+
 std::pair<const VulkanBuffer*, size_t> VulkanBackend::getTensorBuffer(const Tensor* tensor) const {
-    auto mem = (VulkanBuffer*)(tensor->deviceId());
-    MNN_ASSERT(nullptr != mem);
+    auto deviceId = tensor->deviceId();
+    if (deviceId == 0) {
+        MNN_ERROR("VulkanBackend::getTensorBuffer: Tensor deviceId is null! Tensor address: %p\n", tensor);
+        throw std::runtime_error("VulkanBackend::getTensorBuffer: Tensor deviceId is null (possible OOM)");
+    }
+    auto mem = (VulkanBuffer*)(deviceId);
     return std::make_pair(mem, TensorUtils::getDescribeOrigin(tensor)->offset);
 }
 

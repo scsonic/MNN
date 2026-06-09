@@ -99,14 +99,36 @@ inline void IOHW2OIHW(const T *src, T *dst, Dim O, Dim I, Dim H, Dim W) {
         }
     }
 };
+#include <stdexcept>
+
 inline cl::Buffer &openCLDeferBuffer(const Tensor *tensor) {
-    return *(*(OpenCLBufferNode *)(tensor->deviceId())).buffer.get();
+    auto deviceId = tensor->deviceId();
+    if (deviceId == 0) {
+        MNN_ERROR("openCLDeferBuffer: Tensor deviceId is null! Tensor address: %p\n", tensor);
+        throw std::runtime_error("openCLDeferBuffer: Tensor deviceId is null (possible OOM or initialization failure)");
+    }
+    auto node = (OpenCLBufferNode *)deviceId;
+    if (node->buffer.get() == nullptr) {
+        MNN_ERROR("openCLDeferBuffer: Buffer in OpenCLBufferNode is null! Tensor address: %p\n", tensor);
+        throw std::runtime_error("openCLDeferBuffer: Buffer in OpenCLBufferNode is null");
+    }
+    return *(node->buffer.get());
 }
 inline cl::Buffer &openCLBuffer(const Tensor *tensor) {
-    return (*(cl::Buffer *)(tensor->deviceId()));
+    auto deviceId = tensor->deviceId();
+    if (deviceId == 0) {
+        MNN_ERROR("openCLBuffer: Tensor deviceId is null! Tensor address: %p\n", tensor);
+        throw std::runtime_error("openCLBuffer: Tensor deviceId is null (possible OOM or initialization failure)");
+    }
+    return (*(cl::Buffer *)(deviceId));
 }
 inline cl::Image &openCLImage(const Tensor *tensor) {
-    return (*(cl::Image *)(tensor->deviceId()));
+    auto deviceId = tensor->deviceId();
+    if (deviceId == 0) {
+        MNN_ERROR("openCLImage: Tensor deviceId is null! Tensor address: %p\n", tensor);
+        throw std::runtime_error("openCLImage: Tensor deviceId is null (possible OOM or initialization failure)");
+    }
+    return (*(cl::Image *)(deviceId));
 }
 
 void getImageShape(const std::vector<int> &shape, /* NHWC */

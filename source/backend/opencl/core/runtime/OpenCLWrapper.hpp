@@ -36,11 +36,15 @@
 #include <android/hardware_buffer.h>
 #endif
 
+#include <stdexcept>
+#include <string>
+
 #define MNN_CHECK_NOTNULL(X) MNN_ASSERT(X != NULL)
 
 #define MNN_CHECK_CL_SUCCESS(error, info)                  \
     if (error != CL_SUCCESS) {                       \
-        MNN_PRINT("CL ERROR CODE : %d, info:%s \n", (int)error, info); \
+        MNN_ERROR("CL ERROR CODE : %d, info:%s \n", (int)error, info); \
+        throw std::runtime_error("OpenCL Error " + std::to_string(error) + ": " + std::string(info)); \
     }
 #ifdef MNN_USE_LIB_WRAPPER
 

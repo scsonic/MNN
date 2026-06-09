@@ -21,13 +21,19 @@
 #include "core/Macro.h"
 #include "vulkan/vulkan.h"
 #include <MNN/MNNDefine.h>
+#include <stdexcept>
+
 // Vulkan call wrapper
 #define CALL_VK(func) \
 { \
-auto restemp = (func); MNN_ASSERT(restemp == VK_SUCCESS); \
+    auto restemp = (func); \
+    if (restemp != VK_SUCCESS) { \
+        MNN_ERROR("Vulkan call failed: %s at %s:%d, error code: %d\n", #func, __FILE__, __LINE__, (int)restemp); \
+        throw std::runtime_error("Vulkan call failed: " #func); \
+    } \
 }
 
-#define MNN_VK_CHECK(res) if(res != VK_SUCCESS) MNN_PRINT("Error code : %d\n", res);
+#define MNN_VK_CHECK(res) if(res != VK_SUCCESS) MNN_ERROR("Error code : %d\n", res);
 
 /* Initialize the Vulkan function pointer variables declared in this header.
  * Returns 0 if vulkan is not available, non-zero if it is available.

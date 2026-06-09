@@ -22,6 +22,8 @@
 #include <GLES2/gl2.h>
 #endif
 //#define OPENCL_FALLBACK_LOG
+#include <stdexcept>
+
 namespace MNN {
 namespace OpenCL {
 #ifndef MNN_OPENCL_SEP_BUILD
@@ -63,6 +65,10 @@ CLRuntime::CLRuntime(const Backend::Info& info){
     
     //Whether runtimeError
     mCLRuntimeError = mOpenCLRuntime->isCreateError();
+    if (mCLRuntimeError) {
+        MNN_ERROR("CLRuntime: OpenCLRuntime initialization error! Throwing exception.\n");
+        throw std::runtime_error("CLRuntime: OpenCLRuntime initialization error");
+    }
     mTunedInfo = new TuneInfo;
     
     mImagePool.reset(new ImagePool(mOpenCLRuntime->context()));
