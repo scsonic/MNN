@@ -128,6 +128,12 @@ bool Diffusion::initRuntimeManagers(bool gpuBufferMode, int attentionHint) {
             std::string cachePath = mModelPath + "/.mnn_cl_cache";
             runtime_manager_->setCache(cachePath.c_str());
         }
+        if (config.type == MNN_FORWARD_NN) {
+            // QNN context binary cache: avoid re-compiling on second+ runs.
+            std::string cachePath = mModelPath + "/.qnn_unet_cache";
+            runtime_manager_->setCache(cachePath.c_str());
+            MNN_PRINT("[Flux2Klein] QNN cache path: %s\n", cachePath.c_str());
+        }
         if (mMemoryMode == 0)      runtime_manager_->setHint(Interpreter::WINOGRAD_MEMORY_LEVEL, 0);
         else if (mMemoryMode == 2) runtime_manager_->setHint(Interpreter::WINOGRAD_MEMORY_LEVEL, 1);
         if (config.type == MNN_FORWARD_CPU)

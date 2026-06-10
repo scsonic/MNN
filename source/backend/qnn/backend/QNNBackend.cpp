@@ -106,8 +106,8 @@ static void createQnnContext(){
             const QnnDevice_Config_t ** deviceConfig = nullptr;
             auto qnnStatus = qnnInterface.deviceCreate(logHandle, deviceConfig, &deviceHandle);
             if(qnnStatus != QNN_SUCCESS || (deviceHandle == nullptr)) {
-                // INVALID_CONFIG (14001) is returned when no explicit HTP config is given.
-                // Continue with nullptr deviceHandle — contextCreate will use the default device.
+                // INVALID_CONFIG (14001) returned when device config is missing/unsupported.
+                // Continue with nullptr deviceHandle; contextCreate will use the default device.
                 MNN_PRINT("MNN_QNN: deviceCreate returned %lu, proceeding with default device\n", (unsigned long)qnnStatus);
                 deviceHandle = nullptr;
             }
@@ -117,7 +117,7 @@ static void createQnnContext(){
             } else {
                 // QnnDevice_PlatformInfo_t platformInfo = QNN_DEVICE_PLATFORM_INFO_INIT;
                 const QnnDevice_PlatformInfo_t* backendPlatformInfoPtr = nullptr;
-                qnnStatus = qnnInterface.deviceGetPlatformInfo(logHandle, &backendPlatformInfoPtr);
+                auto qnnStatus = qnnInterface.deviceGetPlatformInfo(logHandle, &backendPlatformInfoPtr);
                 if(qnnStatus != QNN_SUCCESS || backendPlatformInfoPtr == nullptr) {
                     MNN_PRINT("[Warning]: deviceGetPlatformInfo Failed to query platform info");
                 } else {
@@ -2067,6 +2067,8 @@ QnnRuntime::QnnRuntime(const Backend::Info& info, QNN_INTERFACE_VER_TYPE qnnInte
     mQnnLogHandle = qnnLogHandle;
     mQnnBackendHandle = qnnBackendHandle;
     mQnnDeviceHandle = qnnDeviceHandle;
+    // Use nullptr config (default) — PERSISTENT_BINARY is rejected by older firmware.
+    mQnnContextConfig = nullptr;
 }
 
 QnnRuntime::~QnnRuntime() {
@@ -2075,22 +2077,47 @@ QnnRuntime::~QnnRuntime() {
     }
 }
 bool QnnRuntime::onSetCache(const void* buffer, size_t size) {
-    // TODO: Fix bug and complete
-    return false;
-    if (nullptr == buffer) {
+    if (nullptr == buffer || size == 0) {
         return false;
     }
-    auto error = mQnnInterface.contextValidateBinary(mQnnBackendHandle, mQnnDeviceHandle, mQnnContextConfig, buffer, size);
-    if (QNN_SUCCESS != error) {
-        MNN_ERROR("QNN: Failed to validate binary: %d\n", (int) error);
+    // Copy into mBinaryBuffer so allocContext() can reload after clean() frees the context.
+    mBinaryBuffer.assign(static_cast<const int8_t*>(buffer),
+                         static_cast<const int8_t*>(buffer) + size);
+    int validateErr = QNN_GET_ERROR_CODE(mQnnInterface.contextValidateBinary(
+        mQnnBackendHandle, mQnnDeviceHandle, mQnnContextConfig,
+        mBinaryBuffer.data(), mBinaryBuffer.size()));
+    if (validateErr != QNN_SUCCESS) {
+        MNN_PRINT("MNN_QNN: cache binary invalid (%d), will JIT compile\n", validateErr);
+        mBinaryBuffer.clear();
         return false;
     }
     freeContext();
-    CALL_QNN(mQnnInterface.contextCreateFromBinary(mQnnBackendHandle, mQnnDeviceHandle, mQnnContextConfig, buffer, size, &mQnnContextHandle, nullptr));
+    int createErr = QNN_GET_ERROR_CODE(mQnnInterface.contextCreateFromBinary(
+        mQnnBackendHandle, mQnnDeviceHandle, mQnnContextConfig,
+        mBinaryBuffer.data(), mBinaryBuffer.size(), &mQnnContextHandle, nullptr));
+    if (createErr != QNN_SUCCESS || mQnnContextHandle == nullptr) {
+        MNN_PRINT("MNN_QNN: contextCreateFromBinary failed (%d), will JIT compile\n", createErr);
+        mBinaryBuffer.clear();
+        return false;
+    }
     mUseCache = true;
+    MNN_PRINT("MNN_QNN: Loaded QNN context from binary cache (%zu bytes)\n", mBinaryBuffer.size());
     return true;
 }
 void QnnRuntime::allocContext() const {
+    if (mUseCache && !mBinaryBuffer.empty()) {
+        // Re-create from binary after clean() freed the previous handle.
+        int err = QNN_GET_ERROR_CODE(mQnnInterface.contextCreateFromBinary(
+            mQnnBackendHandle, mQnnDeviceHandle, mQnnContextConfig,
+            mBinaryBuffer.data(), mBinaryBuffer.size(), &mQnnContextHandle, nullptr));
+        if (err == QNN_SUCCESS && mQnnContextHandle != nullptr) {
+            MNN_PRINT("MNN_QNN: Re-loaded QNN context from binary cache\n");
+            return;
+        }
+        MNN_PRINT("MNN_QNN: Re-load from binary failed (%d), falling back to JIT\n", err);
+        mUseCache = false;
+        mBinaryBuffer.clear();
+    }
     CALL_QNN(mQnnInterface.contextCreate(mQnnBackendHandle, mQnnDeviceHandle, mQnnContextConfig, &mQnnContextHandle));
     MNN_ASSERT(mQnnContextHandle != nullptr);
 }
@@ -2098,12 +2125,15 @@ void QnnRuntime::freeContext() const {
     if (nullptr != mQnnContextHandle) {
         CALL_QNN(mQnnInterface.contextFree(mQnnContextHandle, nullptr));
         mQnnContextHandle = nullptr;
-        mBinaryBuffer.clear();
+        if (!mUseCache) {
+            // Preserve the binary buffer when caching so allocContext() can reload.
+            mBinaryBuffer.clear();
+        }
     }
 }
 
 std::pair<const void*, size_t> QnnRuntime::onGetCache() {
-    return std::make_pair(nullptr, 0);
+    // If already serialized (cache-hit path), return it directly.
     if (!mBinaryBuffer.empty()) {
         return std::make_pair(mBinaryBuffer.data(), mBinaryBuffer.size());
     }
@@ -2111,15 +2141,23 @@ std::pair<const void*, size_t> QnnRuntime::onGetCache() {
         return std::make_pair(nullptr, 0);
     }
     Qnn_ContextBinarySize_t size = 0;
-    CALL_QNN(mQnnInterface.contextGetBinarySize(mQnnContextHandle, &size));
-    FUNC_PRINT(size);
-    if (0 == size) {
+    int sizeErr = QNN_GET_ERROR_CODE(mQnnInterface.contextGetBinarySize(mQnnContextHandle, &size));
+    if (sizeErr != QNN_SUCCESS || size == 0) {
+        MNN_PRINT("MNN_QNN: contextGetBinarySize failed (%d) or size=0, skipping cache\n", sizeErr);
         return std::make_pair(nullptr, 0);
     }
     mBinaryBuffer.resize(size);
     Qnn_ContextBinarySize_t writesize = 0;
-    CALL_QNN(mQnnInterface.contextGetBinary(mQnnContextHandle, mBinaryBuffer.data(), size, &writesize));
-    return std::make_pair(mBinaryBuffer.data(), mBinaryBuffer.size());
+    int getErr = QNN_GET_ERROR_CODE(mQnnInterface.contextGetBinary(
+        mQnnContextHandle, mBinaryBuffer.data(), size, &writesize));
+    if (getErr != QNN_SUCCESS) {
+        MNN_PRINT("MNN_QNN: contextGetBinary failed (%d), skipping cache\n", getErr);
+        mBinaryBuffer.clear();
+        return std::make_pair(nullptr, 0);
+    }
+    mBinaryBuffer.resize(writesize);
+    MNN_PRINT("MNN_QNN: Serialized QNN context binary: %u bytes — will save to cache\n", (unsigned)writesize);
+    return std::make_pair(mBinaryBuffer.data(), (size_t)writesize);
 }
 
 Backend* QnnRuntime::onCreate(const BackendConfig* config, Backend* origin) const {

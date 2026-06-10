@@ -157,7 +157,7 @@ private:
     static bool registerCustomOpPackage(QNN_INTERFACE_VER_TYPE qnnInterface, Qnn_BackendHandle_t backendHandle, const std::string & path, const std::string & interfaceProvider, const std::string & target);
 
 private:
-    bool mUseCache = false;
+    mutable bool mUseCache = false;
 
     // Backend config
     Backend::Info mInfo;
