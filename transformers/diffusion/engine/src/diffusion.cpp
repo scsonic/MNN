@@ -125,7 +125,8 @@ bool Diffusion::initRuntimeManagers(bool gpuBufferMode, int attentionHint) {
             return false;
         }
         if (config.type == MNN_FORWARD_OPENCL) {
-            runtime_manager_->setCache(".tempcache");
+            std::string cachePath = mModelPath + "/.mnn_cl_cache";
+            runtime_manager_->setCache(cachePath.c_str());
         }
         if (mMemoryMode == 0)      runtime_manager_->setHint(Interpreter::WINOGRAD_MEMORY_LEVEL, 0);
         else if (mMemoryMode == 2) runtime_manager_->setHint(Interpreter::WINOGRAD_MEMORY_LEVEL, 1);
@@ -134,8 +135,8 @@ bool Diffusion::initRuntimeManagers(bool gpuBufferMode, int attentionHint) {
         if (attentionHint > 0)
             runtime_manager_->setHint(Interpreter::ATTENTION_OPTION, attentionHint);
 
-        // CPU fallback runtime for text encoder on GPU backends
-        if (mTextEncoderOnCPU && (config.type == MNN_FORWARD_OPENCL || config.type == MNN_FORWARD_VULKAN)) {
+        // CPU fallback runtime for text encoder on GPU/NPU backends
+        if (mTextEncoderOnCPU && (config.type == MNN_FORWARD_OPENCL || config.type == MNN_FORWARD_VULKAN || config.type == MNN_FORWARD_NN)) {
             ScheduleConfig cpuConfig;
             cpuConfig.type = MNN_FORWARD_CPU;
             cpuConfig.numThread = mNumThreads;
@@ -146,8 +147,8 @@ bool Diffusion::initRuntimeManagers(bool gpuBufferMode, int attentionHint) {
             runtime_manager_cpu_.reset(Executor::RuntimeManager::createRuntimeManager(cpuConfig));
             runtime_manager_cpu_->setHint(Interpreter::DYNAMIC_QUANT_OPTIONS, 0);
         }
-        // CPU fallback runtime for VAE on GPU backends
-        if (mVaeOnCPU && (config.type == MNN_FORWARD_OPENCL || config.type == MNN_FORWARD_VULKAN)) {
+        // CPU fallback runtime for VAE on GPU/NPU backends
+        if (mVaeOnCPU && (config.type == MNN_FORWARD_OPENCL || config.type == MNN_FORWARD_VULKAN || config.type == MNN_FORWARD_NN)) {
             ScheduleConfig cpuConfig;
             cpuConfig.type = MNN_FORWARD_CPU;
             cpuConfig.numThread = mNumThreads;

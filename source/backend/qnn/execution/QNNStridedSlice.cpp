@@ -163,24 +163,26 @@ void QNNStridedSlice::computeRangesType0(const std::vector<Tensor *> &inputs, st
 }
 
 void QNNStridedSlice::computeRangesType1(const std::vector<Tensor *> &inputs, std::vector<int> & beginRaw, std::vector<int> & endRaw, std::vector<int> & strideRaw) {
-    auto inputTensor = inputs[0];
     auto beginTensor = inputs[1];
-    auto endTensor = inputs[2];
-    auto strideTensor = inputs[4];
-    auto beginRawSource = beginTensor->host<int>();
-    auto endRawSource = endTensor->host<int>();
-    auto strideRawSource = strideTensor->host<int>();
+    auto endTensor   = inputs[2];
+    auto axisTensor  = inputs[3];
+    // inputs[4] is optional (strides); if absent, strides default to 1
+    int* strideRawSource = nullptr;
+    if (inputs.size() >= 5) {
+        strideRawSource = inputs[4]->host<int>();
+    }
 
-    auto axisTensor = inputs[3];
+    auto beginRawSource = beginTensor->host<int>();
+    auto endRawSource   = endTensor->host<int>();
+
     int sliceDim = beginTensor->length(0);
-    MNN_ASSERT(sliceDim == endTensor->length(0) && sliceDim == axisTensor->length(0) && sliceDim == strideTensor->length(0));
 
     for (int i = 0; i < sliceDim; i++) {
         int tempAxis = axisTensor->host<int>()[i];
         tempAxis = tempAxis >= 0 ? tempAxis : (tempAxis + mInputDim);
         beginRaw[tempAxis] = CLIP(beginRawSource[i], 0, inputs[0]->length(tempAxis) - 1);
-        endRaw[tempAxis] = CLIP(endRawSource[i], 1, inputs[0]->length(tempAxis));
-        strideRaw[tempAxis] = strideRawSource[i];
+        endRaw[tempAxis]   = CLIP(endRawSource[i],   1, inputs[0]->length(tempAxis));
+        strideRaw[tempAxis] = strideRawSource ? strideRawSource[i] : 1;
     }
     return;
 }
@@ -213,29 +215,73 @@ public:
         }
 
         if (param->fromType() == 1) {
+            MNN_PRINT("QNNStridedSlice fromType1: inputs=%zu shrink=%d newAxis=%d ellipsis=%d\n",
+                inputs.size(), param->shrinkAxisMask(), param->newAxisMask(), param->ellipsisMask());
             MNN_ASSERT(param->shrinkAxisMask() == 0 && param->newAxisMask() == 0 && param->ellipsisMask() == 0);
-            if (inputs.size() != 5) {
-                return nullptr;
+            // Accept 4 inputs [data, begin, end, axis] — strides implicitly = 1
+            // OR 5 inputs [data, begin, end, axis, strides]
+            if (inputs.size() == 4 || inputs.size() == 5) {
+                return new QNNStridedSlice(backend, op);
             }
-            return new QNNStridedSlice(backend, op);
+            MNN_PRINT("QNNStridedSlice fromType1: unexpected %zu inputs, falling back\n", inputs.size());
+            return nullptr;
         }
 
         // [TODO] 把newAxisMask和ellipsisMask考虑在内
         if (param->fromType() == 0) {
-            if (inputs.size() == 4 && param->newAxisMask() == 0 && param->ellipsisMask() == 0) {
+            MNN_PRINT("QNNStridedSlice creator: inputs=%zu newAxisMask=%d ellipsisMask=%d shrinkAxisMask=%d\n",
+                inputs.size(), param->newAxisMask(), param->ellipsisMask(), param->shrinkAxisMask());
+            if (inputs.size() == 4 && param->ellipsisMask() == 0) {
+                // Accept newAxisMask==0 only for QNN compatibility (newAxis not supported on HTP)
+                if (param->newAxisMask() != 0) {
+                    MNN_PRINT("QNNStridedSlice: newAxisMask=%d not supported, falling back\n", param->newAxisMask());
+                    return nullptr;
+                }
                 return new QNNStridedSlice(backend, op);
             } else {
+                MNN_PRINT("QNNStridedSlice: fromType0 rejected inputs=%zu ellipsisMask=%d\n",
+                    inputs.size(), param->ellipsisMask());
                 return nullptr;
             }
         }
 
-        // Shouldn't reach here.
+        MNN_PRINT("QNNStridedSlice: unknown fromType=%d, falling back\n", param->fromType());
         return nullptr;
     }
 };
 
 REGISTER_QNN_OP_CREATOR(QNNStridedSliceCreator, OpType_StridedSlice)
 REGISTER_QNN_OP_CREATOR(QNNStridedSliceCreator, OpType_Slice)
+
+// ---- QNNTile: maps MNN OpType_Tile to QNN "Tile" node ----
+class QNNTile : public QNNCommonExecution {
+public:
+    QNNTile(Backend *b, const Op *op) : QNNCommonExecution(b, op) {}
+    ErrorCode onEncode(const std::vector<Tensor *> &inputs, const std::vector<Tensor *> &outputs) override {
+        auto multTensor = inputs[1];
+        int ndim = multTensor->length(0);
+        std::vector<int> multData(ndim);
+        for (int i = 0; i < ndim; i++) multData[i] = multTensor->host<int>()[i];
+        this->createParamTensor("multiples", QNN_DATATYPE_INT_32, {(uint32_t)ndim}, multData.data());
+        mNodeType = "Tile";
+        mParams.push_back(*(mParamTensorWrappers[0]->getNativeParam()));
+        mInputs.push_back(*(mBackend->getNativeTensor(inputs[0])));
+        mOutputs.push_back(*(mBackend->getNativeTensor(outputs[0])));
+        mBackend->addNodeToGraph(mOpConfigVersion, mNodeName.c_str(), mPackageName.c_str(),
+                                 mNodeType.c_str(), mParams, mInputs, mOutputs);
+        return NO_ERROR;
+    }
+};
+class QNNTileCreator : public QnnBackend::Creator {
+public:
+    QNNCommonExecution *onCreate(const std::vector<Tensor*> &inputs, const std::vector<Tensor*> &outputs,
+                                 const MNN::Op *op, Backend *backend) const override {
+        if (inputs.size() < 2) return nullptr;
+        if (TensorUtils::getDescribe(inputs[1])->usage != Tensor::InsideDescribe::Usage::CONSTANT) return nullptr;
+        return new QNNTile(backend, op);
+    }
+};
+REGISTER_QNN_OP_CREATOR(QNNTileCreator, OpType_Tile)
 #endif
 } // end namespace QNN
 } // end namespace MNN

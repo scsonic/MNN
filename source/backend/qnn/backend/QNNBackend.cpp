@@ -74,14 +74,13 @@ static void createQnnContext(){
     qnnInterface = QNN::gQnnConvertorInterface;
 #endif
 
-    // Create Log.
+    // Create Log (optional — continue with nullptr if unavailable on older vendor libs).
     Qnn_LogHandle_t logHandle = nullptr;
     {
         QnnLog_Callback_t logCallback = nullptr;
-        if ((QNN_GET_ERROR_CODE(qnnInterface.logCreate(logCallback, QNN_LOG_LEVEL_ERROR, &logHandle)) != QNN_SUCCESS) ||
-            (logHandle == nullptr)) {
-            MNN_PRINT("MNN_QNN: Failed to initialize logging in the backend.\n");
-            return;
+        if (QNN_GET_ERROR_CODE(qnnInterface.logCreate(logCallback, QNN_LOG_LEVEL_ERROR, &logHandle)) != QNN_SUCCESS) {
+            MNN_PRINT("MNN_QNN: Log init failed, continuing without logging\n");
+            logHandle = nullptr;
         }
     }
 
@@ -107,8 +106,10 @@ static void createQnnContext(){
             const QnnDevice_Config_t ** deviceConfig = nullptr;
             auto qnnStatus = qnnInterface.deviceCreate(logHandle, deviceConfig, &deviceHandle);
             if(qnnStatus != QNN_SUCCESS || (deviceHandle == nullptr)) {
-                MNN_PRINT("MNN_QNN: Failed to create the device, error:%lu\n", (unsigned long)qnnStatus);
-                return;
+                // INVALID_CONFIG (14001) is returned when no explicit HTP config is given.
+                // Continue with nullptr deviceHandle — contextCreate will use the default device.
+                MNN_PRINT("MNN_QNN: deviceCreate returned %lu, proceeding with default device\n", (unsigned long)qnnStatus);
+                deviceHandle = nullptr;
             }
 
             if (qnnInterface.deviceGetPlatformInfo == nullptr) {
@@ -126,8 +127,9 @@ static void createQnnContext(){
                 }
             }
         } else {
-            MNN_PRINT("MNN_QNN: Not supporting device API.\n");
-            return;
+            // Older QNN libs (e.g. v2.0) may not support the device property API.
+            // Continue without a device handle; contextCreate will use the default device.
+            MNN_PRINT("MNN_QNN: Device API not supported, continuing with default device\n");
         }
     }
 
@@ -1205,7 +1207,7 @@ public:
         mRawExecutor.reset();
     }
     bool init(CPUKernelContext* ctx) override {
-        if (QNN::gContext.deviceHandle == nullptr){
+        if (QNN::gContext.backendHandle == nullptr){
             QNN::createQnnContext();
         }
         auto seqLen = ctx->getAttr("seq_len");

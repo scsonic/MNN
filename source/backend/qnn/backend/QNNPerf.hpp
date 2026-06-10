@@ -27,9 +27,10 @@ public:
 private:
     const QNN_INTERFACE_VER_TYPE * mQnnInterface = nullptr;
     QnnHtpDevice_PerfInfrastructure_t mPerfInfra{};
-    uint32_t mPowerConfigId;
+    uint32_t mPowerConfigId = 0;
     QnnHtpPerfInfrastructure_PowerConfig_t mPowerConfigBurst{};
     QnnHtpPerfInfrastructure_PowerConfig_t mPowerConfigBalanced{};
+    bool mEnabled = true;
 };
 
 } // end namespace QNN

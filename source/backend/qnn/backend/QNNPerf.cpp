@@ -15,8 +15,20 @@ QNNPerf::QNNPerf(const QNN_INTERFACE_VER_TYPE * qnnInterface) {
     MNN_ASSERT(qnnInterface != nullptr);
     mQnnInterface = qnnInterface;
 
+    // deviceGetInfrastructure is only available in newer QNN API (>= 2.x).
+    // On older vendor libs it may be null or return an error — skip perf config gracefully.
+    if (!mQnnInterface->deviceGetInfrastructure) {
+        MNN_PRINT("MNN_QNN: deviceGetInfrastructure not available, disabling perf config\n");
+        mEnabled = false;
+        return;
+    }
     QnnDevice_Infrastructure_t deviceInfra = nullptr;
-    CALL_QNN(mQnnInterface->deviceGetInfrastructure(&deviceInfra));
+    int perfErr = QNN_GET_ERROR_CODE(mQnnInterface->deviceGetInfrastructure(&deviceInfra));
+    if (perfErr != QNN_SUCCESS || deviceInfra == nullptr) {
+        MNN_PRINT("MNN_QNN: deviceGetInfrastructure failed (%d), disabling perf config\n", perfErr);
+        mEnabled = false;
+        return;
+    }
     QnnHtpDevice_Infrastructure_t *htpInfra  = static_cast<QnnHtpDevice_Infrastructure_t *>(deviceInfra);
     mPerfInfra = htpInfra->perfInfra;
 
@@ -73,11 +85,13 @@ QNNPerf::QNNPerf(const QNN_INTERFACE_VER_TYPE * qnnInterface) {
 
 // destory power config
 QNNPerf::~QNNPerf() {
+    if (!mEnabled) return;
     CALL_QNN(mPerfInfra.destroyPowerConfigId(mPowerConfigId));
 }
 
 
 void QNNPerf::setRpcLatencyAndPolling() {
+    if (!mEnabled) return;
     // set RPC Control Latency
     QnnHtpPerfInfrastructure_PowerConfig_t rpcControlLatency;            // refer QnnHtpPerfInfrastructure.h
     ::memset(&rpcControlLatency, 0, sizeof(rpcControlLatency));
@@ -98,14 +112,13 @@ void QNNPerf::setRpcLatencyAndPolling() {
 }
 
 void QNNPerf::setPowerConfigBurst() {
-    #ifdef QNN_VERBOSE
-    MNN_PRINT("MNN QNN set burst mode\n");
-    #endif
+    if (!mEnabled) return;
     const QnnHtpPerfInfrastructure_PowerConfig_t *powerConfigs[] = {&mPowerConfigBurst, NULL};
     CALL_QNN(mPerfInfra.setPowerConfig(mPowerConfigId, powerConfigs));
 }
 
 void QNNPerf::setPowerConfigBalanced() {
+    if (!mEnabled) return;
     const QnnHtpPerfInfrastructure_PowerConfig_t *powerConfigs[] = {&mPowerConfigBalanced, NULL};
     CALL_QNN(mPerfInfra.setPowerConfig(mPowerConfigId, powerConfigs));
 }
