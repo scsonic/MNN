@@ -57,6 +57,14 @@ VARP hostCopy(VARP v) {
     return dst;
 }
 
+// QWEN_IMAGE21_DUMP=<dir> writes intermediate tensors as raw float32 for offline comparison.
+void dump(const char* name, const float* data, size_t n) {
+    const char* dir = getenv("QWEN_IMAGE21_DUMP");
+    if (!dir) return;
+    std::ofstream f(std::string(dir) + "/" + name + ".f32", std::ios::binary);
+    f.write((const char*)data, n * sizeof(float));
+}
+
 VARP hostTensor(const std::vector<int>& dims, const float* data) {
     auto v = _Input(dims, NCHW, halide_type_of<float>());
     size_t n = 1;
@@ -162,21 +170,31 @@ VARP QwenImage21Diffusion::encodePrompt(const std::string& prompt) {
         MNN_ERROR("[QwenImage21] text encoder forward failed\n");
         return nullptr;
     }
-    auto outputs = mTextEncoder->getOutputs();
-    int index = mTextEncoder->getOutputIndex(mTeOutputName);
-    if (index < 0 || index >= (int)outputs.size()) {
-        MNN_ERROR("[QwenImage21] text encoder has no output %s; check text_encoder/te_llm_config.json\n",
-                  mTeOutputName.c_str());
-        return nullptr;
+    VARP result;
+    {
+        // Every VARP that references text-encoder memory must die before the encoder is unloaded.
+        auto outputs = mTextEncoder->getOutputs();
+        int index = mTextEncoder->getOutputIndex(mTeOutputName);
+        if (index < 0 || index >= (int)outputs.size()) {
+            MNN_ERROR("[QwenImage21] text encoder has no output %s; check text_encoder/te_llm_config.json\n",
+                      mTeOutputName.c_str());
+            return nullptr;
+        }
+        auto hidden = _Convert(outputs[index], NCHW);  // [1, T, 4096]
+        int T = hidden->getInfo()->dim[1];
+        int L = T - mDropIdx;
+        std::vector<float> host((size_t)L * kDim);
+        ::memcpy(host.data(), hidden->readMap<float>() + (size_t)mDropIdx * kDim, host.size() * sizeof(float));
+        dump("text_hidden", host.data(), host.size());
+        dump("text_hidden_full", hidden->readMap<float>(), (size_t)T * kDim);
+        hidden = nullptr;
+        outputs.clear();
+        mTextEncoder->reset();
+        ExecutorScope scope(Executor::getGlobalExecutor());
+        result = _Input({1, L, kDim}, NCHW, halide_type_of<float>());
+        ::memcpy(result->writeMap<float>(), host.data(), host.size() * sizeof(float));
+        result.fix(VARP::CONSTANT);
     }
-    auto hidden = _Convert(outputs[index], NCHW);  // [1, T, 4096]
-    auto info = hidden->getInfo();
-    int T = info->dim[1];
-    int L = T - mDropIdx;
-    auto result = _Input({1, L, kDim}, NCHW, halide_type_of<float>());
-    ::memcpy(result->writeMap<float>(), hidden->readMap<float>() + (size_t)mDropIdx * kDim, (size_t)L * kDim * sizeof(float));
-    result.fix(VARP::CONSTANT);
-    outputs.clear();
     if (mMemoryMode != 1) {
         mTextEncoder.reset();
         MNN_PRINT("[QwenImage21] text encoder unloaded\n");
@@ -267,6 +285,8 @@ VARP QwenImage21Diffusion::buildPrefixCache(VARP textHidden) {
                                   hostTensor({1, 1, L, L + 1}, mask.data())});
     if (out.empty()) return nullptr;
     auto kv = hostCopy(out[0]);
+    dump("prefix_kv", kv->readMap<float>(), kv->getInfo()->size);
+    dump("txt_h", hidden->readMap<float>(), hidden->getInfo()->size);
     MNN_PRINT("[QwenImage21] prefix pass L=%d: %.2f s\n", L, (nowUs() - st) / 1e6);
     out.clear();
     prefix.reset();
@@ -311,6 +331,10 @@ VARP QwenImage21Diffusion::denoise(VARP prefixKV, int textLen, int steps, int se
         auto v = _Convert(out[0], NCHW);
         const float* vp = v->readMap<float>();
         if (!vp) return nullptr;
+        if (i == 0) {
+            dump("noise", latents.data(), latents.size());
+            dump("v0", vp, latents.size());
+        }
         float dt = sig[i + 1] - sig[i];
         bool bad = false;
         for (size_t k = 0; k < latents.size(); ++k) {
@@ -328,6 +352,7 @@ VARP QwenImage21Diffusion::denoise(VARP prefixKV, int textLen, int steps, int se
         mDitStep.reset();
         mImgIn.reset();
     }
+    dump("latents", latents.data(), latents.size());
     return hostTensor({1, N, kLatentC}, latents.data());
 }
 
@@ -354,21 +379,73 @@ VARP QwenImage21Diffusion::decode(VARP packedLatents) {
     return img;
 }
 
+namespace {
+uint32_t crc32(const uint8_t* p, size_t n, uint32_t c = 0xffffffffu) {
+    for (size_t i = 0; i < n; ++i) {
+        c ^= p[i];
+        for (int k = 0; k < 8; ++k) c = (c >> 1) ^ (0xedb88320u & (0u - (c & 1u)));
+    }
+    return c;
+}
+void put32(std::vector<uint8_t>& v, uint32_t x) {
+    v.push_back(x >> 24); v.push_back(x >> 16); v.push_back(x >> 8); v.push_back(x);
+}
+void chunk(std::ofstream& f, const char* type, const std::vector<uint8_t>& data) {
+    std::vector<uint8_t> buf(type, type + 4);
+    buf.insert(buf.end(), data.begin(), data.end());
+    std::vector<uint8_t> head;
+    put32(head, (uint32_t)data.size());
+    std::vector<uint8_t> tail;
+    put32(tail, crc32(buf.data(), buf.size()) ^ 0xffffffffu);
+    f.write((const char*)head.data(), 4);
+    f.write((const char*)buf.data(), buf.size());
+    f.write((const char*)tail.data(), 4);
+}
+// Minimal RGBA PNG writer (stored deflate blocks); MNN cv's imwrite only handles 1/3 channels.
+bool writePngRGBA(const std::string& path, const uint8_t* rgba, int w, int h) {
+    std::ofstream f(path, std::ios::binary);
+    if (!f) return false;
+    const uint8_t sig[8] = {137, 80, 78, 71, 13, 10, 26, 10};
+    f.write((const char*)sig, 8);
+    std::vector<uint8_t> ihdr;
+    put32(ihdr, w); put32(ihdr, h);
+    ihdr.insert(ihdr.end(), {8, 6, 0, 0, 0});
+    chunk(f, "IHDR", ihdr);
+    std::vector<uint8_t> raw;
+    raw.reserve((size_t)h * (w * 4 + 1));
+    for (int y = 0; y < h; ++y) {
+        raw.push_back(0);
+        raw.insert(raw.end(), rgba + (size_t)y * w * 4, rgba + (size_t)(y + 1) * w * 4);
+    }
+    std::vector<uint8_t> z = {0x78, 0x01};
+    uint32_t a = 1, b = 0;
+    for (auto c : raw) { a = (a + c) % 65521; b = (b + a) % 65521; }
+    for (size_t pos = 0; pos < raw.size(); pos += 65535) {
+        size_t n = std::min<size_t>(65535, raw.size() - pos);
+        z.push_back(pos + n == raw.size() ? 1 : 0);
+        z.push_back(n & 0xff); z.push_back(n >> 8);
+        z.push_back(~n & 0xff); z.push_back((~n >> 8) & 0xff);
+        z.insert(z.end(), raw.begin() + pos, raw.begin() + pos + n);
+    }
+    put32(z, (b << 16) | a);
+    chunk(f, "IDAT", z);
+    chunk(f, "IEND", {});
+    return (bool)f;
+}
+} // namespace
+
 bool QwenImage21Diffusion::saveRGBA(VARP image, const std::string& path) {
     auto info = image->getInfo();
     int C = info->dim[1], H = info->dim[2], W = info->dim[3];
     const float* p = image->readMap<float>();
-    auto hwc = _Input({H, W, C}, NHWC, halide_type_of<uint8_t>());
-    auto dst = hwc->writeMap<uint8_t>();
-    for (int c = 0; c < C; ++c) {
+    std::vector<uint8_t> rgba((size_t)H * W * 4, 255);
+    for (int c = 0; c < std::min(C, 4); ++c) {
         for (int i = 0; i < H * W; ++i) {
             float v = (p[(size_t)c * H * W + i] * 0.5f + 0.5f) * 255.0f;
-            v = std::min(255.0f, std::max(0.0f, std::round(v)));
-            dst[(size_t)i * C + c] = (uint8_t)v;
+            rgba[(size_t)i * 4 + c] = (uint8_t)std::min(255.0f, std::max(0.0f, std::round(v)));
         }
     }
-    // imwrite swaps BGR->RGB for 3 channels only; 4-channel data is written as RGBA as is.
-    return imwrite(path, hwc);
+    return writePngRGBA(path, rgba.data(), W, H);
 }
 
 // ---------------------------------------------------------------------------------------------- run
