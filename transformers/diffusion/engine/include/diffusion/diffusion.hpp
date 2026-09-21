@@ -134,6 +134,7 @@ typedef enum {
     STABLE_DIFFUSION_ZIMAGE = 3,
     LONGCAT_IMAGE_EDIT = 4,
     FLUX2_KLEIN_DIFFUSION = 5,
+    WAN2_1_T2V = 6,
     DIFFUSION_MODEL_USER
 } DiffusionModelType;
 
@@ -217,7 +218,10 @@ public:
                     int iterNum, int randomSeed,
                     bool use_cfg, float cfg_scale,
                     std::function<void(int)> progressCallback) = 0;
-    
+
+    virtual bool runVideo(const std::string& prompt, const std::string& outputDir, int width, int height, int frames,
+                          int steps, int seed, float cfgScale, std::function<void(int)> progressCallback);
+
     virtual bool load() = 0;
 
     // Image processing utility functions (static, model-agnostic)

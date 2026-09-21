@@ -9,15 +9,20 @@
 #ifdef MNN_SUPPORT_TRANSFORMER_FUSE
 #include <MNN/expr/Expr.hpp>
 #include <MNN/expr/ExprCreator.hpp>
+#include <MNN/expr/Executor.hpp>
+#include <MNN/expr/ExecutorScope.hpp>
 #include <MNN/expr/Module.hpp>
 #include "core/OpCommonUtils.hpp"
+#include "core/KVMeta.hpp"
 #include "MNNTestSuite.h"
 #include "TestUtils.h"
 #include <cmath>
+#include <cstdio>
 #include <cstring>
 #include <vector>
 #include <numeric>
 #include <algorithm>
+#include <sys/stat.h>
 
 using namespace MNN::Express;
 
@@ -222,7 +227,9 @@ struct NaiveLinearAttention {
 // ─── Helper: create a LinearAttention Module via FlatBuffers ───
 static std::shared_ptr<Module> _makeLinearAttentionModule(
     int numKHeads, int numVHeads, int headKDim, int headVDim, bool useL2Norm,
-    const std::string& attnType = "gated_delta_rule")
+    const std::string& attnType = "gated_delta_rule", bool forceOpenCLBuffer = false,
+    bool gateFold = false, const std::vector<float>& gateCoef = std::vector<float>(),
+    const std::vector<float>& gateBias = std::vector<float>())
 {
     auto qkv      = _Input();
     auto gate     = _Input();
@@ -240,6 +247,9 @@ static std::shared_ptr<Module> _makeLinearAttentionModule(
     param->head_k_dim   = headKDim;
     param->head_v_dim   = headVDim;
     param->use_qk_l2norm = useL2Norm;
+    param->gate_fold    = gateFold;
+    param->gate_coef    = gateCoef;
+    param->gate_bias    = gateBias;
 
     auto o = Variable::create(Expr::create(op.get(), {qkv, gate, beta, convW}));
     auto buffer = Variable::save({o});
@@ -252,7 +262,9 @@ static std::shared_ptr<Module> _makeLinearAttentionModule(
     bnConfig.precision = (MNN::BackendConfig::PrecisionMode)status.precision;
     bnConfig.power     = (MNN::BackendConfig::PowerMode)status.power;
     config.backendConfig = &bnConfig;
-    config.numThread = 1;
+    config.numThread = forceOpenCLBuffer && status.forwardType == MNN_FORWARD_OPENCL
+                           ? MNN_GPU_MEMORY_BUFFER | MNN_GPU_TUNING_WIDE
+                           : 1;
 
     std::shared_ptr<Executor::RuntimeManager> rtmgr(Executor::RuntimeManager::createRuntimeManager(config));
     std::shared_ptr<Module> m(Module::load({}, {}, (uint8_t*)buffer.data(), buffer.size(), rtmgr));
@@ -463,11 +475,170 @@ public:
             MNN_PRINT("LinearAttention No-L2Norm Test (L=%d) PASSED\n", L);
         }
 
+        // ─── Test 4: Chunk-64 prefill (Qwen3.5 shape) ───
+        // dk=dv=128 with L >= 64 is the only shape that reaches the chunked
+        // prefill kernels; the cases above all stay on the scalar/decode paths.
+        // L=192 is an exact chunk multiple, L=100 leaves a partial tail chunk
+        // whose padded lanes still carry the chunk's gate cumsum.
+        {
+            const int numHeads = 16;
+            const int wideKDim = 128, wideVDim = 128;
+            const int wideKeyDim = numHeads * wideKDim;
+            const int wideD = 2 * wideKeyDim + numHeads * wideVDim;
+            // Relative to the output scale (see below).  The deviation from the
+            // sequential reference measures 0.16~0.23% at both fp16 and fp32
+            // storage, i.e. it comes from the chunked reassociation rather than
+            // precision, so one 1% band covers both with ~4x headroom.
+            const float wideTolerance = 0.01f;
+
+            for (int L : {192, 100}) {
+                auto module = _makeLinearAttentionModule(numHeads, numHeads, wideKDim, wideVDim, useL2Norm);
+                if (!module) {
+                    MNN_PRINT("Error: Failed to create chunk64 LinearAttention module\n");
+                    return false;
+                }
+
+                auto qkvVar   = _Input({B, wideD, L}, NCHW, halide_type_of<float>());
+                auto gateVar  = _Input({B, L, numHeads}, NCHW, halide_type_of<float>());
+                auto betaVar  = _Input({B, L, numHeads}, NCHW, halide_type_of<float>());
+                auto convWVar = _Input({wideD, 1, K_conv}, NCHW, halide_type_of<float>());
+
+                fillDeterministic(qkvVar->writeMap<float>(), B * wideD * L, 0.03f);
+                fillGate(gateVar->writeMap<float>(), B * L * numHeads);
+                fillBeta(betaVar->writeMap<float>(), B * L * numHeads);
+                fillConvWeight(convWVar->writeMap<float>(), wideD * K_conv);
+
+                NaiveLinearAttention naive;
+                naive.init(B, wideD, K_conv, numHeads, wideKDim, wideVDim);
+                auto expected = naive.forward(
+                    qkvVar->readMap<float>(), gateVar->readMap<float>(),
+                    betaVar->readMap<float>(), convWVar->readMap<float>(),
+                    B, L, wideD, K_conv, numHeads, numHeads, wideKDim, wideVDim, useL2Norm);
+
+                auto outputs = module->onForward({qkvVar, gateVar, betaVar, convWVar});
+                if (outputs.empty()) {
+                    MNN_PRINT("Error: chunk64 prefill (L=%d) returned empty output\n", L);
+                    return false;
+                }
+                const float* resultPtr = outputs[0]->readMap<float>();
+                const int outSize = B * L * numHeads * wideVDim;
+
+                // An absolute tolerance is vacuous here: the reference outputs
+                // are far below 1.0, so scale the comparison by the observed
+                // magnitude and refuse a degenerate scale outright.
+                float scale = 0.0f;
+                for (int i = 0; i < outSize; ++i) {
+                    scale = std::max(scale, fabsf(expected[i]));
+                }
+                if (scale < 1e-3f) {
+                    MNN_PRINT("Chunk64 Prefill (L=%d) reference is degenerate (max=%g)\n", L, scale);
+                    return false;
+                }
+                float maxDiff = 0.0f;
+                int worst = 0;
+                for (int i = 0; i < outSize; ++i) {
+                    float diff = fabs(resultPtr[i] - expected[i]);
+                    if (diff > maxDiff) {
+                        maxDiff = diff;
+                        worst = i;
+                    }
+                }
+                if (maxDiff > wideTolerance * scale) {
+                    MNN_PRINT("Chunk64 Prefill FAILED (L=%d) at index %d: expected %.6f, got %.6f (diff=%.6f, scale=%.6f, rel=%.4f%%)\n",
+                              L, worst, expected[worst], resultPtr[worst], maxDiff, scale,
+                              100.0f * maxDiff / scale);
+                    return false;
+                }
+                MNN_PRINT("LinearAttention Chunk64 Prefill (L=%d, dk=dv=128, H=16) PASSED (max rel dev %.4f%%)\n",
+                          L, 100.0f * maxDiff / scale);
+            }
+        }
+
         return true;
     }
 };
 
 MNNTestSuiteRegister(LinearAttentionTest, "op/linear_attention");
+
+static VARP makeC4TokenChannelInput(const std::vector<float>& logical, int tokenCount, int channels,
+                                    bool channelMajor) {
+    std::vector<float> packed(UP_DIV(channels, 4) * tokenCount * 4, 0.0f);
+    for (int t = 0; t < tokenCount; ++t) {
+        for (int c = 0; c < channels; ++c) {
+            int logicalIndex = channelMajor ? c * tokenCount + t : t * channels + c;
+            int packedIndex = ((c / 4) * tokenCount + t) * 4 + c % 4;
+            packed[packedIndex] = logical[logicalIndex];
+        }
+    }
+    auto input = _Input({tokenCount, channels, 1, 1}, NC4HW4, halide_type_of<float>());
+    ::memcpy(input->writeMap<float>(), packed.data(), packed.size() * sizeof(float));
+    input->unMap();
+    return input;
+}
+
+class LinearAttentionC4TailTest : public MNNTestCase {
+public:
+    virtual ~LinearAttentionC4TailTest() = default;
+
+    virtual bool run(int precision) {
+        const int B = 1;
+        const int L = 3;
+        const int numKHeads = 1;
+        const int numVHeads = 3;
+        const int headKDim = 4;
+        const int headVDim = 5;
+        const int kernelSize = 4;
+        const int keyDim = numKHeads * headKDim;
+        const int valueDim = numVHeads * headVDim;
+        const int convDim = 2 * keyDim + valueDim;
+
+        std::vector<float> qkv(B * convDim * L);
+        std::vector<float> gate(B * L * numVHeads);
+        std::vector<float> beta(B * L * numVHeads);
+        std::vector<float> convWeight(convDim * kernelSize);
+        fillDeterministic(qkv.data(), qkv.size(), 0.05f);
+        fillGate(gate.data(), gate.size());
+        fillBeta(beta.data(), beta.size());
+        fillConvWeight(convWeight.data(), convWeight.size());
+
+        NaiveLinearAttention naive;
+        naive.init(B, convDim, kernelSize, numVHeads, headKDim, headVDim);
+        auto expected = naive.forward(qkv.data(), gate.data(), beta.data(), convWeight.data(), B, L, convDim,
+                                      kernelSize, numKHeads, numVHeads, headKDim, headVDim, true);
+
+        auto qkvVar = makeC4TokenChannelInput(qkv, L, convDim, true);
+        auto gateVar = makeC4TokenChannelInput(gate, L, numVHeads, false);
+        auto betaVar = makeC4TokenChannelInput(beta, L, numVHeads, false);
+        auto convWeightVar = _Input({convDim, 1, kernelSize}, NCHW, halide_type_of<float>());
+        ::memcpy(convWeightVar->writeMap<float>(), convWeight.data(), convWeight.size() * sizeof(float));
+        convWeightVar->unMap();
+
+        auto module = _makeLinearAttentionModule(numKHeads, numVHeads, headKDim, headVDim, true);
+        if (!module) {
+            return false;
+        }
+        auto outputs = module->onForward({qkvVar, gateVar, betaVar, convWeightVar});
+        if (outputs.empty()) {
+            return false;
+        }
+        const float* result = outputs[0]->readMap<float>();
+        const int outputTokens = L * numVHeads;
+        for (int token = 0; token < outputTokens; ++token) {
+            for (int d = 0; d < headVDim; ++d) {
+                int packedIndex = ((d / 4) * outputTokens + token) * 4 + d % 4;
+                int logicalIndex = token * headVDim + d;
+                if (fabs(result[packedIndex] - expected[logicalIndex]) > 0.02f) {
+                    MNN_ERROR("LinearAttention C4 tail failed at token=%d, channel=%d: expected=%f, actual=%f\n",
+                              token, d, expected[logicalIndex], result[packedIndex]);
+                    return false;
+                }
+            }
+        }
+        return true;
+    }
+};
+
+MNNTestSuiteRegister(LinearAttentionC4TailTest, "op/linear_attention_c4_tail");
 
 // ─── Decode fast path test: focuses on L=1 correctness and state consistency ───
 class LinearAttentionDecodeTest : public MNNTestCase {
@@ -531,7 +702,7 @@ public:
         // ─── Test 2: Prefill then multi-step decode (state continuity) ───
         {
             const int B = 1, numKHeads = 2, numVHeads = 2;
-            const int headKDim = 4, headVDim = 4, K_conv = 4;
+            const int headKDim = 4, headVDim = 4, K_conv = 1;
             const int key_dim = numKHeads * headKDim;
             const int val_dim = numVHeads * headVDim;
             const int D = 2 * key_dim + val_dim;
@@ -842,10 +1013,720 @@ public:
             MNN_PRINT("LinearAttention Decode batch (B=%d, %d steps) PASSED\n", B, decodeSteps);
         }
 
+        // Qwen3.5 uses d_v=128 and a 6144-channel conv. Multiple C4 decode
+        // steps exercise conv-state shifts across Metal threadgroup boundaries.
+        {
+            const int B = 1, numKHeads = 16, numVHeads = 16;
+            const int headKDim = 128, headVDim = 128, K_conv = 4;
+            const int key_dim = numKHeads * headKDim;
+            const int val_dim = numVHeads * headVDim;
+            const int D = 2 * key_dim + val_dim;
+            const int L = 1;
+            const int decodeSteps = 256;
+            const float qwenTolerance = precision == MNN::BackendConfig::Precision_Low ? 0.015f : 0.002f;
+
+            auto module = _makeLinearAttentionModule(numKHeads, numVHeads, headKDim, headVDim, true,
+                                                     "gated_delta_rule", true);
+            if (!module) {
+                MNN_PRINT("Error: Failed to create Qwen3.5 LinearAttention module\n");
+                return false;
+            }
+
+            auto convWVar = _Input({D, 1, K_conv}, NCHW, halide_type_of<float>());
+            fillConvWeight(convWVar->writeMap<float>(), D * K_conv);
+
+            NaiveLinearAttention naive;
+            naive.init(B, D, K_conv, numVHeads, headKDim, headVDim);
+            const float* convWeight = convWVar->readMap<float>();
+            auto checkOutput = [&](const std::vector<VARP>& outputs, const std::vector<float>& expected,
+                                   int tokenCount, int step) {
+                if (outputs.empty()) {
+                    MNN_PRINT("Error: Qwen3.5 LinearAttention step %d returned empty output\n", step);
+                    return false;
+                }
+                const float* resultPtr = outputs[0]->readMap<float>();
+                const int outputTokens = tokenCount * numVHeads;
+                for (int token = 0; token < outputTokens; ++token) {
+                    for (int d = 0; d < headVDim; ++d) {
+                        int packedIndex = ((d / 4) * outputTokens + token) * 4 + d % 4;
+                        int logicalIndex = token * headVDim + d;
+                        float diff = fabs(resultPtr[packedIndex] - expected[logicalIndex]);
+                        if (!std::isfinite(resultPtr[packedIndex]) ||
+                            diff > qwenTolerance + 0.02f * fabs(expected[logicalIndex])) {
+                            MNN_PRINT("Qwen3.5 C4 step %d FAILED at %d: expected %.6f, got %.6f (diff=%.6f)\n",
+                                      step, logicalIndex, expected[logicalIndex], resultPtr[packedIndex], diff);
+                            return false;
+                        }
+                    }
+                }
+                return true;
+            };
+
+            const int prefillLength = 14;
+            std::vector<float> prefillQkv(B * D * prefillLength);
+            std::vector<float> prefillGate(B * prefillLength * numVHeads);
+            std::vector<float> prefillBeta(B * prefillLength * numVHeads);
+            fillDeterministic(prefillQkv.data(), prefillQkv.size(), 0.08f, 0.01f);
+            fillGate(prefillGate.data(), prefillGate.size());
+            fillBeta(prefillBeta.data(), prefillBeta.size());
+            auto prefillExpected = naive.forward(prefillQkv.data(), prefillGate.data(), prefillBeta.data(), convWeight,
+                                                 B, prefillLength, D, K_conv, numKHeads, numVHeads, headKDim,
+                                                 headVDim, true);
+            auto prefillOutputs = module->onForward({makeC4TokenChannelInput(prefillQkv, prefillLength, D, true),
+                                                     makeC4TokenChannelInput(prefillGate, prefillLength, numVHeads,
+                                                                             false),
+                                                     makeC4TokenChannelInput(prefillBeta, prefillLength, numVHeads,
+                                                                             false),
+                                                     convWVar});
+            if (!checkOutput(prefillOutputs, prefillExpected, prefillLength, -1)) {
+                return false;
+            }
+
+            for (int step = 0; step < decodeSteps; ++step) {
+                std::vector<float> qkv(B * D * L);
+                std::vector<float> gate(B * L * numVHeads);
+                std::vector<float> beta(B * L * numVHeads);
+                fillDeterministic(qkv.data(), qkv.size(), 0.08f, 0.01f * (step + 1));
+                fillGate(gate.data(), gate.size());
+                fillBeta(beta.data(), beta.size());
+
+                auto expected = naive.forward(qkv.data(), gate.data(), beta.data(), convWeight, B, L, D, K_conv,
+                                              numKHeads, numVHeads, headKDim, headVDim, true);
+                auto qkvVar = makeC4TokenChannelInput(qkv, L, D, true);
+                auto gateVar = makeC4TokenChannelInput(gate, L, numVHeads, false);
+                auto betaVar = makeC4TokenChannelInput(beta, L, numVHeads, false);
+                auto outputs = module->onForward({qkvVar, gateVar, betaVar, convWVar});
+                if (!checkOutput(outputs, expected, L, step)) {
+                    return false;
+                }
+            }
+            MNN_PRINT("LinearAttention Qwen3.5 C4 prefill(%d)+decode(%d) layout (H=%d, dv=%d) PASSED\n",
+                      prefillLength, decodeSteps, numVHeads, headVDim);
+        }
+
         return true;
     }
 };
 
 MNNTestSuiteRegister(LinearAttentionDecodeTest, "op/linear_attention_decode");
+
+// Wires a caller-owned KVMeta through the KVCACHE_INFO hint; must be the real
+// MNN::KVMeta, since a local mirror would be read past its end.
+static std::shared_ptr<Module> _makeLinearAttentionModuleWithMeta(int numKHeads, int numVHeads, int headKDim,
+                                                                  int headVDim, bool useL2Norm, MNN::KVMeta* meta) {
+    auto qkv = _Input();
+    auto gate = _Input();
+    auto beta = _Input();
+    auto convW = _Input();
+
+    std::shared_ptr<MNN::OpT> op(new MNN::OpT);
+    op->type = MNN::OpType_LinearAttention;
+    op->main.type = MNN::OpParameter_LinearAttentionParam;
+    op->main.value = new MNN::LinearAttentionParamT;
+    auto* param = op->main.AsLinearAttentionParam();
+    param->attn_type = "gated_delta_rule";
+    param->num_k_heads = numKHeads;
+    param->num_v_heads = numVHeads;
+    param->head_k_dim = headKDim;
+    param->head_v_dim = headVDim;
+    param->use_qk_l2norm = useL2Norm;
+
+    auto o = Variable::create(Expr::create(op.get(), {qkv, gate, beta, convW}));
+    auto buffer = Variable::save({o});
+
+    MNN::ScheduleConfig config;
+    auto status = MNNTestSuite::get()->pStaus;
+    config.type = (MNNForwardType)status.forwardType;
+    MNN::BackendConfig bnConfig;
+    bnConfig.memory = (MNN::BackendConfig::MemoryMode)status.memory;
+    bnConfig.precision = (MNN::BackendConfig::PrecisionMode)status.precision;
+    bnConfig.power = (MNN::BackendConfig::PowerMode)status.power;
+    config.backendConfig = &bnConfig;
+    config.numThread = 1;
+
+    std::shared_ptr<Executor::RuntimeManager> rtmgr(Executor::RuntimeManager::createRuntimeManager(config));
+    rtmgr->setHintPtr(MNN::Interpreter::KVCACHE_INFO, meta);
+    std::shared_ptr<Module> m(Module::load({}, {}, (uint8_t*)buffer.data(), buffer.size(), rtmgr));
+    return m;
+}
+
+// ─── Rollback test: verify the explicit-rollback path in CPULinearAttention::onResize ───
+//
+// Background: LinearAttention's recurrent state has no token-level structure,
+// so Llm::eraseHistory() cannot truncate it. The fix introduces:
+//   (a) a snapshot of the post-prefix state taken inside the prefix-cache
+//       disk file_flag branches (PendingRead/PendingWrite), and
+//   (b) an explicit-rollback branch in onResize that, when mMeta->remove > 0,
+//       restores from the snapshot if mSnapshotValid is true, otherwise zeros
+//       the state.
+//
+// This test covers branch (b) without snapshot (mSnapshotValid=false), the
+// most common rollback path when prefix cache is not in use:
+//
+//   Module A: prefill(X)  -> internal state advances  (no snapshot taken,
+//                            since file_flag stays NoChange throughout)
+//             [simulate Llm: meta.previous = X.len, meta.remove = X.len]
+//             prefill(Y)  -> isExplicitRollback fires, mSnapshotValid=false,
+//                            so state is zeroed before Y is applied.
+//
+//   Module B: prefill(Y) on a brand-new module starting from zero state.
+//
+// Module A's second-prefill output and Module B's only-prefill output must
+// match byte-for-byte (within float tolerance), proving:
+//   - the rollback branch is hit when remove>0 in prefill,
+//   - it correctly clears state to zero when no snapshot is available, and
+//   - subsequent computation is equivalent to a fresh-init module.
+//
+// The "snapshot exists" path (mSnapshotValid=true) requires real prefix-cache
+// disk files (.k/.v + setExternalPath(EXTERNAL_PATH_PREFIXCACHE_DIR, ...)) and
+// is exercised by rollback_demo Stage 3 against actual model bundles.
+class LinearAttentionRollbackTest : public MNNTestCase {
+public:
+    LinearAttentionRollbackTest() = default;
+    virtual ~LinearAttentionRollbackTest() = default;
+
+    virtual bool run(int precision) {
+        const int B = 1, numKHeads = 2, numVHeads = 2;
+        const int headKDim = 4, headVDim = 4, K_conv = 4;
+        const int key_dim = numKHeads * headKDim;
+        const int val_dim = numVHeads * headVDim;
+        const int D = 2 * key_dim + val_dim;
+        const int prefillLen = 4;
+        const float tolerance = 0.001f;
+        const int outSize = B * prefillLen * numVHeads * headVDim;
+
+        // Shared conv weight across both modules so the only variable is state.
+        auto convWVar = _Input({D, 1, K_conv}, NCHW, halide_type_of<float>());
+        fillConvWeight(convWVar->writeMap<float>(), D * 1 * K_conv);
+
+        // ─── Module A: prefill(X) -> simulate eraseHistory -> prefill(Y) ───
+        MNN::KVMeta metaA;
+        auto moduleA = _makeLinearAttentionModuleWithMeta(numKHeads, numVHeads, headKDim, headVDim, true, &metaA);
+        if (!moduleA) {
+            MNN_PRINT("RollbackTest: failed to create moduleA\n");
+            return false;
+        }
+
+        // Step 1: prefill X. metaA.previous=0 here makes onResize treat this as
+        // a fresh prefill (zeros state, drops any snapshot — none yet anyway).
+        {
+            auto qkvVar = _Input({B, D, prefillLen}, NCHW, halide_type_of<float>());
+            auto gateVar = _Input({B, prefillLen, numVHeads}, NCHW, halide_type_of<float>());
+            auto betaVar = _Input({B, prefillLen, numVHeads}, NCHW, halide_type_of<float>());
+            fillDeterministic(qkvVar->writeMap<float>(), B * D * prefillLen, 0.07f, 0.0f);
+            fillGate(gateVar->writeMap<float>(), B * prefillLen * numVHeads);
+            fillBeta(betaVar->writeMap<float>(), B * prefillLen * numVHeads);
+            auto outputs = moduleA->onForward({qkvVar, gateVar, betaVar, convWVar});
+            if (outputs.empty()) {
+                MNN_PRINT("RollbackTest: moduleA prefill X returned empty output\n");
+                return false;
+            }
+            // Force evaluation so internal state is fully updated before next call.
+            (void)outputs[0]->readMap<float>();
+        }
+
+        // Step 2: simulate the meta updates Llm performs around eraseHistory.
+        //   - updateContext after prefill X: meta.previous += prefillLen
+        //   - eraseHistory(0, previous): meta.remove = previous
+        metaA.previous = prefillLen;
+        metaA.remove = prefillLen;
+
+        // Step 3: prefill Y. onResize sees remove>0 -> isExplicitRollback;
+        // mSnapshotValid=false (no PendingRead/PendingWrite ever fired), so
+        // the rollback branch zeros mConvState/mRecurrentState before forward.
+        std::vector<float> outputA(outSize, 0.0f);
+        {
+            auto qkvVar = _Input({B, D, prefillLen}, NCHW, halide_type_of<float>());
+            auto gateVar = _Input({B, prefillLen, numVHeads}, NCHW, halide_type_of<float>());
+            auto betaVar = _Input({B, prefillLen, numVHeads}, NCHW, halide_type_of<float>());
+            // Use distinct input from X so we don't accidentally pass the test
+            // when the rollback is silently skipped (state would carry X's effect).
+            fillDeterministic(qkvVar->writeMap<float>(), B * D * prefillLen, 0.05f, 0.1f);
+            fillGate(gateVar->writeMap<float>(), B * prefillLen * numVHeads);
+            fillBeta(betaVar->writeMap<float>(), B * prefillLen * numVHeads);
+            auto outputs = moduleA->onForward({qkvVar, gateVar, betaVar, convWVar});
+            if (outputs.empty()) {
+                MNN_PRINT("RollbackTest: moduleA prefill Y after rollback returned empty output\n");
+                return false;
+            }
+            const float* p = outputs[0]->readMap<float>();
+            ::memcpy(outputA.data(), p, outSize * sizeof(float));
+        }
+
+        // ─── Module B: fresh prefill(Y) baseline ───
+        MNN::KVMeta metaB;
+        auto moduleB = _makeLinearAttentionModuleWithMeta(numKHeads, numVHeads, headKDim, headVDim, true, &metaB);
+        if (!moduleB) {
+            MNN_PRINT("RollbackTest: failed to create moduleB\n");
+            return false;
+        }
+        std::vector<float> outputB(outSize, 0.0f);
+        {
+            auto qkvVar = _Input({B, D, prefillLen}, NCHW, halide_type_of<float>());
+            auto gateVar = _Input({B, prefillLen, numVHeads}, NCHW, halide_type_of<float>());
+            auto betaVar = _Input({B, prefillLen, numVHeads}, NCHW, halide_type_of<float>());
+            // Identical Y inputs as moduleA's step 3.
+            fillDeterministic(qkvVar->writeMap<float>(), B * D * prefillLen, 0.05f, 0.1f);
+            fillGate(gateVar->writeMap<float>(), B * prefillLen * numVHeads);
+            fillBeta(betaVar->writeMap<float>(), B * prefillLen * numVHeads);
+            auto outputs = moduleB->onForward({qkvVar, gateVar, betaVar, convWVar});
+            if (outputs.empty()) {
+                MNN_PRINT("RollbackTest: moduleB fresh prefill Y returned empty output\n");
+                return false;
+            }
+            const float* p = outputs[0]->readMap<float>();
+            ::memcpy(outputB.data(), p, outSize * sizeof(float));
+        }
+
+        // ─── Compare: A's post-rollback prefill must equal B's fresh prefill ───
+        for (int i = 0; i < outSize; ++i) {
+            float diff = fabs(outputA[i] - outputB[i]);
+            if (diff > tolerance) {
+                MNN_PRINT(
+                    "Rollback (mSnapshotValid=false) FAILED at index %d: "
+                    "rollback=%.6f fresh=%.6f diff=%.6f\n",
+                    i, outputA[i], outputB[i], diff);
+                return false;
+            }
+        }
+        MNN_PRINT("LinearAttention Rollback (no snapshot, state zeroed) PASSED\n");
+        return true;
+    }
+};
+
+MNNTestSuiteRegister(LinearAttentionRollbackTest, "op/linear_attention_rollback");
+
+// ─── Chunked prefix-cache layer_index drift test ───
+//
+// Background: prefix-cache file naming uses mMeta->layer_index as a counter
+// that each layer's onExecute advances by 1, wrapping mod layer_nums. The
+// counter is shared between LinearAttention and CPUKVCacheManager (Full
+// Attention). CPUKVCacheManager advances it ONLY inside onAlloc, which fires
+// on chunk 1 (when mMeta->previous == mMeta->remove); chunks 2..N go through
+// onRealloc, which does NOT touch layer_index.
+//
+// Before the fix, CPULinearAttention advanced layer_index inside its
+// PendingWrite/PendingRead branches on EVERY chunk's onExecute. In hybrid
+// models (attention_type="mix"), this caused LinearAttention's counter to
+// drift past Full Attention's layer positions on chunks 2..N — LA would
+// compute the wrong file index and overwrite Full Attention's prefix cache
+// .k/.v files, corrupting their live mmap regions and triggering SIGBUS on
+// subsequent FA access.
+//
+// The fix captures layer_index ONCE per session (when previous == remove)
+// into mStateCache->mPrefixLayerIndex; subsequent chunks reuse the cached
+// value and do NOT touch mMeta->layer_index. This mirrors CPUKVCacheManager's
+// once-per-session advancement semantics so the two co-exist correctly.
+//
+// This test exercises the layer_index lifecycle directly on a single
+// LinearAttention op (no FA dependency needed to expose the regression):
+//   chunk 1 (previous == remove == 0): expect layer_index to advance by 1.
+//   chunk 2 (previous > 0, remove == 0): expect layer_index UNCHANGED.
+// A failure here means chunks 2..N would clobber some other layer's file.
+class LinearAttentionChunkedLayerIndexTest : public MNNTestCase {
+public:
+    LinearAttentionChunkedLayerIndexTest() = default;
+    virtual ~LinearAttentionChunkedLayerIndexTest() = default;
+
+    virtual bool run(int precision) {
+        const int B = 1, numKHeads = 2, numVHeads = 2;
+        const int headKDim = 4, headVDim = 4, K_conv = 4;
+        const int key_dim = numKHeads * headKDim;
+        const int val_dim = numVHeads * headVDim;
+        const int D = 2 * key_dim + val_dim;
+        const int prefillLen = 4;
+        // Only CPU (CPULinearAttention.cpp:594-603) and OpenCL
+        // (LinearAttentionBufExecution.cpp:1042-1050) implement the linear-attention
+        // prefix cache. MetalLinearAttention never persists LA state — it only reads
+        // the PendingRead flag to decide whether to keep the recurrent state — so it
+        // has no layer_index to capture or advance. Asserting the counter there would
+        // report a missing feature as a wrong result.
+        if (MNNTestSuite::get()->pStaus.forwardType == MNN_FORWARD_METAL) {
+            return true;
+        }
+        // Starting layer_index value chosen to be non-zero so we can
+        // distinguish "no advance" from "reset to zero".
+        const int kInitialLayerIndex = 5;
+        const int kLayerNums = 24;
+
+        // Shared conv weight across both chunks.
+        auto convWVar = _Input({D, 1, K_conv}, NCHW, halide_type_of<float>());
+        fillConvWeight(convWVar->writeMap<float>(), D * 1 * K_conv);
+
+        // Simulate the meta state at the start of a chunked prefix-cache
+        // write session:
+        //   - file_name + file_flag=PendingWrite trigger the prefix-cache
+        //     write branch in CPULinearAttention::onExecute.
+        //   - layer_index = 5 simulates this op being not-first in a multi-
+        //     layer forward pass (previous layers' onExecute have already
+        //     advanced the counter).
+        //   - previous = 0, remove = 0 marks "first chunk" — the per-session
+        //     capture-and-advance block should fire on this call only.
+        MNN::KVMeta meta;
+        meta.file_name = "test_chunked_layer_index";
+        meta.file_flag = MNN::KVMeta::PendingWrite;
+        meta.layer_index = kInitialLayerIndex;
+        meta.layer_nums = kLayerNums;
+        meta.previous = 0;
+        meta.remove = 0;
+
+        auto module = _makeLinearAttentionModuleWithMeta(numKHeads, numVHeads, headKDim, headVDim, true, &meta);
+        if (!module) {
+            MNN_PRINT("ChunkedLayerIndexTest: failed to create module\n");
+            return false;
+        }
+
+        auto runChunk = [&](float seed_offset) -> bool {
+            auto qkvVar = _Input({B, D, prefillLen}, NCHW, halide_type_of<float>());
+            auto gateVar = _Input({B, prefillLen, numVHeads}, NCHW, halide_type_of<float>());
+            auto betaVar = _Input({B, prefillLen, numVHeads}, NCHW, halide_type_of<float>());
+            fillDeterministic(qkvVar->writeMap<float>(), B * D * prefillLen, 0.07f, seed_offset);
+            fillGate(gateVar->writeMap<float>(), B * prefillLen * numVHeads);
+            fillBeta(betaVar->writeMap<float>(), B * prefillLen * numVHeads);
+            auto outputs = module->onForward({qkvVar, gateVar, betaVar, convWVar});
+            if (outputs.empty()) {
+                return false;
+            }
+            // Force evaluation so onExecute (and its meta-state mutations) runs.
+            (void)outputs[0]->readMap<float>();
+            return true;
+        };
+
+        // ─── Chunk 1: should capture layer_index=5 and advance to 6 ───
+        if (!runChunk(0.0f)) {
+            MNN_PRINT("ChunkedLayerIndexTest: chunk 1 forward failed\n");
+            return false;
+        }
+        if (meta.layer_index != kInitialLayerIndex + 1) {
+            MNN_PRINT(
+                "ChunkedLayerIndexTest FAIL: after chunk 1, layer_index = %d, "
+                "expected %d (capture-and-advance must bump once on the first "
+                "PendingWrite call of a session)\n",
+                meta.layer_index, kInitialLayerIndex + 1);
+            return false;
+        }
+
+        // ─── Between chunks: simulate the meta updates Llm performs ───
+        //   sync() at end of forwardRaw: previous += add (= prefillLen), remove resets
+        // layer_index is intentionally NOT touched here — in real hybrid
+        // models, FA layers' onRealloc on chunks 2..N also does NOT touch it.
+        meta.previous = prefillLen;
+        meta.remove = 0;
+        int layer_index_before_chunk2 = meta.layer_index;
+
+        // ─── Chunk 2: must NOT re-advance layer_index ───
+        if (!runChunk(0.1f)) {
+            MNN_PRINT("ChunkedLayerIndexTest: chunk 2 forward failed\n");
+            return false;
+        }
+        if (meta.layer_index != layer_index_before_chunk2) {
+            MNN_PRINT(
+                "ChunkedLayerIndexTest FAIL: after chunk 2, layer_index = %d, "
+                "expected %d (chunks 2..N must reuse mStateCache->mPrefixLayerIndex "
+                "without re-advancing mMeta->layer_index — the drift was the "
+                "root cause of LA overwriting FA's prefix cache files in hybrid "
+                "models, manifesting as SIGBUS on subsequent FA mmap access)\n",
+                meta.layer_index, layer_index_before_chunk2);
+            return false;
+        }
+
+        // Cleanup: PendingWrite branch writes the per-layer prefix cache files
+        // as a side effect. Default prefix cache dir relative to CWD is
+        // "prefixcache/". Remove them so we don't leave artifacts behind.
+        ::remove("prefixcache/test_chunked_layer_index_5.k");
+        ::remove("prefixcache/test_chunked_layer_index_5.v");
+        // (leave the empty prefixcache/ dir behind; harmless and cross-platform-friendly)
+
+        MNN_PRINT("LinearAttention Chunked LayerIndex (per-session capture) PASSED\n");
+        return true;
+    }
+};
+MNNTestSuiteRegister(LinearAttentionChunkedLayerIndexTest, "op/linear_attention_chunked_layer_index");
+
+// ─── Edge case: PendingWrite when previous != remove (capture must be skipped) ───
+//
+// The capture-and-advance block in CPULinearAttention::onExecute only fires
+// when (file_name set, file_flag in {PendingWrite, PendingRead}, previous ==
+// remove). The `previous == remove` predicate identifies "first call of a
+// fresh-or-fully-rolled-back session" (chunk 1 of a new write, or chunk 1
+// after eraseHistory(0, previous)).
+//
+// If something triggers PendingWrite/PendingRead outside that entry path
+// (e.g. partial eraseHistory(begin>0, end) followed by a forced cache write
+// while `mMeta->remove < mMeta->previous`), the capture block is skipped and
+// mStateCache->mPrefixLayerIndex stays at its initial sentinel -1.
+//
+// The PendingWrite branch then constructs a file path using -1 as the layer
+// index, writing junk to "<dir>/<name>_-1.k". This corrupts the prefix cache
+// directory layout — silent on success but reads as a phantom layer to any
+// future PendingRead pass.
+//
+// This test pins down the desired behavior on that mismatched-meta path:
+//   (a) mMeta->layer_index must NOT advance (consistent with all advancement
+//       being moved into the capture block), and
+//   (b) no junk "_-1.{k,v}" file should be created.
+//
+// Failure on (b) means production code needs either a fallback (use
+// mMeta->layer_index when mPrefixLayerIndex == -1) or an early-out guard
+// inside the PendingWrite/PendingRead branches. The test cleans up any junk
+// it may have produced so subsequent runs are not affected by today's bug.
+class LinearAttentionPendingWriteUnsyncedTest : public MNNTestCase {
+public:
+    LinearAttentionPendingWriteUnsyncedTest() = default;
+    virtual ~LinearAttentionPendingWriteUnsyncedTest() = default;
+
+    virtual bool run(int precision) {
+        const int B = 1, numKHeads = 2, numVHeads = 2;
+        const int headKDim = 4, headVDim = 4, K_conv = 4;
+        const int key_dim = numKHeads * headKDim;
+        const int val_dim = numVHeads * headVDim;
+        const int D = 2 * key_dim + val_dim;
+        const int prefillLen = 4;
+        const int kInitialLayerIndex = 5;
+        const int kLayerNums = 24;
+        const std::string cacheName = "test_pending_write_unsynced";
+        const std::string junkK = "prefixcache/" + cacheName + "_-1.k";
+        const std::string junkV = "prefixcache/" + cacheName + "_-1.v";
+
+        // Defensive: remove any pre-existing junk from a previous failing run
+        // so we measure THIS run's behavior.
+        ::remove(junkK.c_str());
+        ::remove(junkV.c_str());
+
+        auto convWVar = _Input({D, 1, K_conv}, NCHW, halide_type_of<float>());
+        fillConvWeight(convWVar->writeMap<float>(), D * 1 * K_conv);
+
+        // Construct meta where PendingWrite fires but the capture-and-advance
+        // condition fails (previous != remove). 4/2 mimics a partial
+        // eraseHistory(begin=2, end=4) followed by a forced cache write.
+        MNN::KVMeta meta;
+        meta.file_name = cacheName;
+        meta.file_flag = MNN::KVMeta::PendingWrite;
+        meta.layer_index = kInitialLayerIndex;
+        meta.layer_nums = kLayerNums;
+        meta.previous = 4;
+        meta.remove = 2;
+
+        auto module = _makeLinearAttentionModuleWithMeta(numKHeads, numVHeads, headKDim, headVDim, true, &meta);
+        if (!module) {
+            MNN_PRINT("PendingWriteUnsyncedTest: failed to create module\n");
+            return false;
+        }
+
+        auto qkvVar = _Input({B, D, prefillLen}, NCHW, halide_type_of<float>());
+        auto gateVar = _Input({B, prefillLen, numVHeads}, NCHW, halide_type_of<float>());
+        auto betaVar = _Input({B, prefillLen, numVHeads}, NCHW, halide_type_of<float>());
+        fillDeterministic(qkvVar->writeMap<float>(), B * D * prefillLen, 0.07f, 0.0f);
+        fillGate(gateVar->writeMap<float>(), B * prefillLen * numVHeads);
+        fillBeta(betaVar->writeMap<float>(), B * prefillLen * numVHeads);
+
+        auto outputs = module->onForward({qkvVar, gateVar, betaVar, convWVar});
+        if (outputs.empty()) {
+            MNN_PRINT("PendingWriteUnsyncedTest: forward failed\n");
+            return false;
+        }
+        (void)outputs[0]->readMap<float>();
+
+        // (a) layer_index must NOT have advanced
+        bool layerIndexOk = (meta.layer_index == kInitialLayerIndex);
+        if (!layerIndexOk) {
+            MNN_PRINT(
+                "PendingWriteUnsyncedTest FAIL (a): layer_index = %d, expected %d "
+                "(capture-and-advance must not fire when previous != remove)\n",
+                meta.layer_index, kInitialLayerIndex);
+        }
+
+        // (b) no junk "_-1.{k,v}" file should be written
+        struct stat st;
+        bool junkKExists = (::stat(junkK.c_str(), &st) == 0);
+        bool junkVExists = (::stat(junkV.c_str(), &st) == 0);
+        bool junkOk = !junkKExists && !junkVExists;
+        if (!junkOk) {
+            MNN_PRINT(
+                "PendingWriteUnsyncedTest FAIL (b): junk files written at sentinel "
+                "index -1: %s=%d %s=%d. Production code should either skip the disk "
+                "write or fall back to mMeta->layer_index when mPrefixLayerIndex is -1.\n",
+                junkK.c_str(), (int)junkKExists, junkV.c_str(), (int)junkVExists);
+        }
+
+        // Cleanup regardless of pass/fail so subsequent runs start clean.
+        ::remove(junkK.c_str());
+        ::remove(junkV.c_str());
+
+        bool ok = layerIndexOk && junkOk;
+        if (ok) {
+            MNN_PRINT("LinearAttention PendingWrite-Unsynced (no capture, no junk write) PASSED\n");
+        }
+        return ok;
+    }
+};
+MNNTestSuiteRegister(LinearAttentionPendingWriteUnsyncedTest, "op/linear_attention_pending_write_unsynced");
+
+// ─── gate_fold equivalence test ───
+// With gate_fold the exporter stops emitting the gate/beta pre-computation as
+// separate elementwise ops: inputs 1/2 then carry the raw a/b projections and the
+// op itself applies
+//   gate = gate_coef[h] * softplus(a + gate_bias[h])
+//   beta = sigmoid(b)
+// Shapes are identical either way, so a backend that ignores the flag produces
+// silently wrong numbers. This drives one set of random a/b through both paths and
+// requires them to agree, which isolates the fold arithmetic from the recurrence.
+class LinearAttentionGateFoldTest : public MNNTestCase {
+    static float softplus(float x) {
+        return logf(1.0f + expf(x));
+    }
+
+    // Backends branch on (L, headKDim, headVDim):
+    //   L == 1                  -> decode kernel
+    //   L > 1 && dk != dv       -> sequential prefill
+    //   L > 1 && dk == dv       -> chunked prefill (separate cumsum / attn kernels)
+    // Every one of them reads gate/beta, so every one has to fold.
+    bool runCase(const char* name, int numKHeads, int numVHeads, int headKDim, int headVDim, int L,
+                 float tolerance) {
+        const int B = 1;
+        const int kernelSize = 4;
+        const int keyDim = numKHeads * headKDim;
+        const int valDim = numVHeads * headVDim;
+        const int D = 2 * keyDim + valDim;
+        const bool useL2Norm = true;
+        const int gateCount = B * L * numVHeads;
+        const int outSize = B * L * numVHeads * headVDim;
+
+        std::vector<float> gateCoef(numVHeads), gateBias(numVHeads);
+        for (int h = 0; h < numVHeads; ++h) {
+            gateCoef[h] = -(0.5f + 0.25f * h); // -exp(A_log) is always negative
+            gateBias[h] = -0.3f + 0.2f * h;
+        }
+
+        std::vector<float> qkv(B * D * L), rawA(gateCount), rawB(gateCount), convWeight(D * kernelSize);
+        fillDeterministic(qkv.data(), (int)qkv.size(), 0.05f);
+        fillConvWeight(convWeight.data(), (int)convWeight.size());
+        for (int i = 0; i < gateCount; ++i) {
+            rawA[i] = -0.4f + 0.15f * (i % 7);
+            rawB[i] = -0.6f + 0.30f * (i % 5);
+        }
+
+        // Host-side fold: exactly the elementwise chain the exporter used to emit.
+        std::vector<float> gate(gateCount), beta(gateCount);
+        for (int t = 0; t < B * L; ++t) {
+            for (int h = 0; h < numVHeads; ++h) {
+                const int i = t * numVHeads + h;
+                gate[i] = gateCoef[h] * softplus(rawA[i] + gateBias[h]);
+                beta[i] = 1.0f / (1.0f + expf(-rawB[i]));
+            }
+        }
+
+        auto runOnce = [&](bool fold, const std::vector<float>& coef, const std::vector<float>& bias,
+                           const std::vector<float>& in1, const std::vector<float>& in2,
+                           std::vector<float>& out) -> bool {
+            // Buffer memory is what actually decides whether OpenCL picks up this op
+            // (see run()); the flag here only covers the case where this module is
+            // the one creating the runtime.
+            auto module = _makeLinearAttentionModule(numKHeads, numVHeads, headKDim, headVDim, useL2Norm,
+                                                     "gated_delta_rule", true, fold, coef, bias);
+            if (!module) {
+                return false;
+            }
+            auto qkvVar = _Input({B, D, L}, NCHW, halide_type_of<float>());
+            auto in1Var = _Input({B, L, numVHeads}, NCHW, halide_type_of<float>());
+            auto in2Var = _Input({B, L, numVHeads}, NCHW, halide_type_of<float>());
+            auto wVar = _Input({D, 1, kernelSize}, NCHW, halide_type_of<float>());
+            ::memcpy(qkvVar->writeMap<float>(), qkv.data(), qkv.size() * sizeof(float));
+            ::memcpy(in1Var->writeMap<float>(), in1.data(), in1.size() * sizeof(float));
+            ::memcpy(in2Var->writeMap<float>(), in2.data(), in2.size() * sizeof(float));
+            ::memcpy(wVar->writeMap<float>(), convWeight.data(), convWeight.size() * sizeof(float));
+            auto outputs = module->onForward({qkvVar, in1Var, in2Var, wVar});
+            if (outputs.empty()) {
+                return false;
+            }
+            const float* p = outputs[0]->readMap<float>();
+            if (p == nullptr) {
+                return false;
+            }
+            out.assign(p, p + outSize);
+            return true;
+        };
+
+        auto compare = [&](const char* label, const std::vector<float>& ref, const std::vector<float>& got) {
+            for (int i = 0; i < outSize; ++i) {
+                const float diff = fabs(ref[i] - got[i]);
+                if (diff > tolerance) {
+                    MNN_PRINT("GateFold %s [%s] FAILED at index %d: reference %.6f, got %.6f (diff=%.6f)\n",
+                              name, label, i, ref[i], got[i], diff);
+                    return false;
+                }
+            }
+            return true;
+        };
+
+        std::vector<float> refOut, foldOut;
+        if (!runOnce(false, gateCoef, gateBias, gate, beta, refOut)) {
+            MNN_PRINT("GateFold %s: reference (fold off) forward failed\n", name);
+            return false;
+        }
+        // Anchor the non-fold path against the host reference first. Without this the
+        // fold/non-fold comparison below is self-referential: both runs share the same
+        // backend, so a bug in the recurrence itself would cancel out and still pass.
+        NaiveLinearAttention naive;
+        naive.init(B, D, kernelSize, numVHeads, headKDim, headVDim);
+        auto naiveOut = naive.forward(qkv.data(), gate.data(), beta.data(), convWeight.data(), B, L, D, kernelSize,
+                                      numKHeads, numVHeads, headKDim, headVDim, useL2Norm);
+        if (!compare("naive", naiveOut, refOut)) {
+            return false;
+        }
+        if (!runOnce(true, gateCoef, gateBias, rawA, rawB, foldOut)) {
+            MNN_PRINT("GateFold %s: folded forward failed\n", name);
+            return false;
+        }
+        if (!compare("fold", refOut, foldOut)) {
+            return false;
+        }
+
+        // gate_fold set but the constants are malformed. A folded graph has no gate
+        // chain left, so there is nothing to fall back to: the op must refuse to run
+        // rather than consume inputs 1/2 as if they were gate/beta.
+        std::vector<float> shortCoef(gateCoef.begin(), gateCoef.end() - 1);
+        std::vector<float> rejectedOut;
+        if (runOnce(true, shortCoef, gateBias, gate, beta, rejectedOut)) {
+            MNN_PRINT("GateFold %s: malformed gate_coef was accepted, expected rejection\n", name);
+            return false;
+        }
+
+        MNN_PRINT("LinearAttention GateFold %s PASSED\n", name);
+        return true;
+    }
+
+public:
+    virtual ~LinearAttentionGateFoldTest() = default;
+
+    virtual bool run(int precision) {
+        const float tolerance = 0.001f;
+        // The shared executor creates its OpenCL runtime before any test runs, and
+        // RuntimeManager reuses that runtime without re-applying numThread, so the
+        // per-module MNN_GPU_MEMORY_BUFFER request is dropped and the memory mode
+        // stays AUTO (IMAGE on most GPUs). LinearAttention only registers a BUFFER
+        // creator, so on OpenCL run under a private executor whose runtime really is
+        // built in buffer mode; otherwise this silently exercises CPU.
+        auto status = MNNTestSuite::get()->pStaus;
+        std::shared_ptr<Executor> privateExe;
+        std::shared_ptr<ExecutorScope> privateScope;
+        if (status.forwardType == MNN_FORWARD_OPENCL) {
+            MNN::BackendConfig bnConfig;
+            bnConfig.memory    = (MNN::BackendConfig::MemoryMode)status.memory;
+            bnConfig.precision = (MNN::BackendConfig::PrecisionMode)status.precision;
+            bnConfig.power     = (MNN::BackendConfig::PowerMode)status.power;
+            privateExe = Executor::newExecutor(MNN_FORWARD_OPENCL, bnConfig,
+                                               MNN_GPU_MEMORY_BUFFER | MNN_GPU_TUNING_WIDE);
+            privateScope.reset(new ExecutorScope(privateExe));
+        }
+        // L=20 on the chunked path spans two chunks, so the tail chunk is partly
+        // padding — padding must contribute an exact 0 to the gate cumsum even though
+        // fold(0) != 0.
+        return runCase("decode", 2, 2, 4, 4, 1, tolerance) &&
+               runCase("prefill-seq", 2, 2, 4, 8, 5, tolerance) &&
+               runCase("prefill-chunked", 2, 2, 4, 4, 20, tolerance);
+    }
+};
+MNNTestSuiteRegister(LinearAttentionGateFoldTest, "op/linear_attention_gate_fold");
 
 #endif // MNN_SUPPORT_TRANSFORMER_FUSE

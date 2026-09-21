@@ -64,8 +64,17 @@ void ArGeneration::generate(GenerationParams& param) {
 #ifdef DUMP_PROFILE_INFO
         ar_sample_us += _t_sample.durationInUs();
 #endif
-        mContext->history_tokens.push_back(mContext->current_token);
-        mContext->output_tokens.push_back(mContext->current_token);
+        if (mContext->current_token < 0) {
+            // Sampling failed (backend execution stopped); abort the loop
+            // instead of feeding an invalid token id to decode/embedding.
+            mContext->status = LlmStatus::INTERNAL_ERROR;
+            break;
+        }
+        {
+            std::lock_guard<std::mutex> _l(mContext->mutex);
+            mContext->history_tokens.push_back(mContext->current_token);
+            mContext->output_tokens.push_back(mContext->current_token);
+        }
         mLlm->updateContext(0, 1);
         if (mLlm->is_stop(mContext->current_token)) {
             if (nullptr != mContext->os) {
@@ -76,7 +85,10 @@ void ArGeneration::generate(GenerationParams& param) {
         // Decode and Output
         MNN::Timer _t;
         auto decodeStr = mLlm->tokenizer_decode(mContext->current_token);
-        mContext->generate_str += decodeStr;
+        {
+            std::lock_guard<std::mutex> _l(mContext->mutex);
+            mContext->generate_str += decodeStr;
+        }
         if (nullptr != mContext->os) {
             *mContext->os << decodeStr;
             *mContext->os << std::flush;

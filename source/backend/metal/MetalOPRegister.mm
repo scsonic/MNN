@@ -15,12 +15,15 @@
   extern void ___MetalLayerNormCreator__OpType_LayerNorm__();
 #ifdef MNN_SUPPORT_TRANSFORMER_FUSE
   extern void ___AttentionBufCreator__OpType_Attention__();
+  extern void ___MetalRoPECreator__OpType_RoPE__();
 #endif
   extern void ___MetalMatMulCreator__OpType_MatMul__();
   extern void ___MetalBinaryCreator__OpType_BinaryOp__();
   extern void ___MetalTopKV2Creator__OpType_TopKV2__();
 #ifdef MNN_SUPPORT_TRANSFORMER_FUSE
   extern void ___MetalLinearAttentionCreator__OpType_LinearAttention__();
+  extern void ___MetalFusedProjCreator__OpType_FusedLinear__();
+  extern void ___MetalGatedRMSNormCreator__OpType_GatedRMSNorm__();
 #endif
   extern void ___MetalConvolutionDepthwiseCreator__OpType_ConvolutionDepthwise__();
   extern void ___MetalDeconvolutionCreator__OpType_Deconvolution__();
@@ -72,8 +75,11 @@ void registerMetalOps() {
    ___MetalReLU6Creator__OpType_ReLU6__();
    ___MetalReLU6Creator__OpType_ReLU__();
 #ifdef MNN_SUPPORT_TRANSFORMER_FUSE
+   ___MetalRoPECreator__OpType_RoPE__();
    ___AttentionBufCreator__OpType_Attention__();
    ___MetalLinearAttentionCreator__OpType_LinearAttention__();
+   ___MetalFusedProjCreator__OpType_FusedLinear__();
+   ___MetalGatedRMSNormCreator__OpType_GatedRMSNorm__();
 #endif
 }
 #endif

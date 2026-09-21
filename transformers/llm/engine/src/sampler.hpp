@@ -70,15 +70,21 @@ public:
     static Sampler* createSampler(std::shared_ptr<LlmContext> context, std::shared_ptr<LlmConfig> config);
     Sampler(std::shared_ptr<LlmContext> context, std::shared_ptr<LlmConfig> config);
     int sample(MNN::Express::VARP logits);
+    int sample(MNN::Express::VARP logits, const std::vector<int>& indices);
+
 private:
     std::shared_ptr<LlmContext> mContext;
     SamplerConfig mConfig;
     std::mt19937 mRng;
+    // Fast top-k prefilter: fetch only top-k values/indices instead of the
+    // full vocab pipeline when topK is the first effective filter step.
+    bool mTopKPrefilter = false;
     // Pipeline
     using SamplerStep = std::function<void(SamplerState&)>;
     std::vector<SamplerStep> mPipeline;
     void buildPipeline();
     SamplerState createState(MNN::Express::VARP logits);
+    SamplerState createState(MNN::Express::VARP logits, const std::vector<int>& indices);
     // Step implementations
     void stepPenalty(SamplerState& state);
     void stepTopK(SamplerState& state);

@@ -48,6 +48,9 @@ typedef SSIZE_T ssize_t;
 #define GEMM_INT8_DST_XUNIT_SME2 16
 #define GEMM_INT8_UNIT_SME2_128 128
 
+/* CPU supports rvv: UNIT / SRC_UNIT are intentionally the baseline ones, only DST_XUNIT differs */
+#define GEMM_INT8_DST_XUNIT_RVV 8
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -104,8 +107,20 @@ struct CoreInt8Functions {
     void(*MNNPackC4Int8ForMatMul_A)(int8_t* destOrigin, int8_t const** sourceGroup, const int32_t* info, const int32_t* el);
     void(*MNNGemmInt8AddBiasScale_Unit_FP16)(int8_t* dst, const int8_t* src, const int8_t* weight, size_t src_depth_quad, size_t dst_step, size_t dst_depth_quad, const QuanPostTreatParameters* post, size_t realDstCount) = nullptr;
     void(*MNNGemmInt8AddBiasScale_w4_Unit_FP16)(int8_t* dst, const int8_t* src, const int8_t* weight, size_t src_depth_quad, size_t dst_step, size_t dst_depth_quad, const QuanPostTreatParameters* post, size_t realDstCount) = nullptr;
+    void (*MNNGemmInt8AddBiasScale_w2_Unit_FP16)(int8_t* dst, const int8_t* src, const int8_t* weight,
+                                                 size_t src_depth_quad, size_t dst_step, size_t dst_depth_quad,
+                                                 const QuanPostTreatParameters* post, size_t realDstCount) = nullptr;
+    void (*MNNGemmInt8AddBiasScale_w3_Unit_FP16)(int8_t* dst, const int8_t* src, const int8_t* weight,
+                                                 size_t src_depth_quad, size_t dst_step, size_t dst_depth_quad,
+                                                 const QuanPostTreatParameters* post, size_t realDstCount) = nullptr;
     void(*Int8GemmKernel_W4)(int8_t* dst, const int8_t* src, const int8_t* weight, size_t src_depth_quad, size_t dst_step, size_t dst_depth_quad,
                                            const QuanPostTreatParameters* post, size_t realDstCount);
+    void (*Int8GemmKernel_W2)(int8_t* dst, const int8_t* src, const int8_t* weight, size_t src_depth_quad,
+                              size_t dst_step, size_t dst_depth_quad, const QuanPostTreatParameters* post,
+                              size_t realDstCount) = nullptr;
+    void (*Int8GemmKernel_W3)(int8_t* dst, const int8_t* src, const int8_t* weight, size_t src_depth_quad,
+                              size_t dst_step, size_t dst_depth_quad, const QuanPostTreatParameters* post,
+                              size_t realDstCount) = nullptr;
     // sparse
     void(*MNNGetSparseQuantMatMulPackMode)(int* eP, int *lP, int* hP);
     void(*MNNPackForSparseQuantMatMul_B)(int8_t* dest, unsigned int* NNZMap, int* dataOffsetMap, int sparseBlockOC, const int8_t* source, size_t h, size_t kernelCount, size_t icCount, const int eP);

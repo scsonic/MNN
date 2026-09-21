@@ -76,6 +76,14 @@ void BufferPool::releaseFreeList() {
     mFreeList = keepList;
 }
 
+size_t BufferPool::residentSize() const {
+    size_t total = 0;
+    for (const auto& iter : mAllBuffer) {
+        total += iter.second->size;
+    }
+    return total;
+}
+
 std::shared_ptr<OpenCLBufferNode> BufferExecutionPool::alloc(size_t size, bool separate) {
     if (!separate) {
         auto iter = mFreeList.lower_bound(size);
@@ -140,6 +148,14 @@ void BufferExecutionPool::releaseFreeList() {
         }
     }
     mFreeList.clear();
+}
+
+size_t BufferExecutionPool::residentSize() const {
+    size_t total = 0;
+    for (const auto& node : mAllBuffer) {
+        total += node->size;
+    }
+    return total;
 }
 } // namespace OpenCL
 } // namespace MNN

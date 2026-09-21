@@ -126,6 +126,7 @@ void registerQNNOps() {
     ___QNNConcatCreator__OpType_Unpack__();
     ___QNNConvDepthwiseCreator__OpType_ConvolutionDepthwise__();
     ___QNNConvolutionCreator__OpType_Convolution__();
+    ___QNNDeconvolutionCreator__OpType_Deconvolution__();
     ___QNNFlattenCreator__OpType_Flatten__();
     ___QNNLayerNormCreator__OpType_LayerNorm__();
     ___QNNPaddingCreator__OpType_Padding__();
@@ -156,6 +157,7 @@ void registerQNNOps() {
     ___QNNDeQuantCreator__OpType_Int8ToFloat__();
     ___QNNTopKV2Creator__OpType_TopKV2__();
     ___QNNTileCreator__OpType_Tile__();
+    ___QNNInterpCreator__OpType_Interp__();
 }
 
 Tensor::DimensionType gQnnTensorDimType = Tensor::TENSORFLOW;

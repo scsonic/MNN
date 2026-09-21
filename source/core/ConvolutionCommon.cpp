@@ -354,7 +354,7 @@ static int8_t *ReadQuanData_c(BaseLoader* s, size_t* len, ConvolutionCommon::Int
             if (len) {
                 *len = blob ? dataCnt : 0;
             }
-            if (result->originBits <= 4 && forceQuant) {
+            if (result->originBits == 4 && forceQuant) {
                 // Reduce blob to 4 bit
                 result->canUseInt4 = true;
                 auto sizeDiv2 = UP_DIV(dataCnt, 2);
@@ -371,6 +371,13 @@ static int8_t *ReadQuanData_c(BaseLoader* s, size_t* len, ConvolutionCommon::Int
                 }
                 MNNMemoryFreeAlign(blob);
                 blob = newBlob;
+            } else if ((result->originBits == 2 || result->originBits == 3) && forceQuant) {
+                // Keep blob as one byte per weight; conv executor will pack to w2/w3 layout.
+                if (result->originBits == 2) {
+                    result->canUseInt2 = true;
+                } else {
+                    result->canUseInt3 = true;
+                }
             }
         }
     } while (0);
@@ -740,7 +747,9 @@ std::shared_ptr<ConvolutionCommon::Int8Common> ConvolutionCommon::load(const Op*
                 MNN_PRINT("Alloc memory error for extract idst int8\n");
                 return nullptr;
             }
-            if(weightPtr != nullptr) {
+            // Low-bit decoding may return a temporary buffer even when the caller supplied
+            // weightPtr. Only the caller-owned buffer must be marked non-owning.
+            if (buffer == weightPtr) {
                 result->weight.set(buffer, false);
             } else {
                 result->weight.set(buffer, (int)weightLength);
@@ -860,7 +869,12 @@ void ConvolutionCommon::getConvParameters(std::shared_ptr<Int8Common> *quanCommo
         *originWeight     = (*quanCommon)->weightFloat.get();
         *originWeightSize = (*quanCommon)->weightFloat.size();
     }
-    if (*originWeight == nullptr) {
+    if (*originWeight == nullptr && nullptr != conv2d->weight()) {
+        // conv2d->weight() is null when the weight is supplied as a runtime
+        // input tensor (e.g. the backprop / weight-as-input deconvolution from
+        // _Deconv(weight, bias, input)). Leave originWeight null in that case
+        // so callers can detect "no embedded weight" instead of dereferencing
+        // a null flatbuffers vector.
         *originWeight = conv2d->weight()->data();
         *originWeightSize = conv2d->weight()->size();
     }

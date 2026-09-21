@@ -62,6 +62,7 @@ option(MNN_DEBUG_TENSOR_SIZE "Enable Tensor Size" OFF)
 option(MNN_GPU_TRACE "Enable MNN Gpu Debug" OFF)
 option(MNN_SUPPORT_RENDER "Enable MNN Render Ops" OFF)
 option(MNN_SUPPORT_TRANSFORMER_FUSE "Enable MNN transformer Fuse Ops" OFF)
+option(MNN_GATED_RMS_NORM "Enable the native GatedRMSNorm kernels (Metal, OpenCL buffer mode), only takes effect when MNN_SUPPORT_TRANSFORMER_FUSE is ON; without it the op is decomposed via geometry" ON)
 option(MNN_SEP_BUILD "Build MNN Backends and expression separately. Only works with MNN_BUILD_SHARED_LIBS=ON" ON)
 option(NATIVE_LIBRARY_OUTPUT "Native Library Path" OFF)
 option(NATIVE_INCLUDE_OUTPUT "Native Include Path" OFF)
@@ -81,11 +82,14 @@ option(MNN_INTERNAL "Build with MNN internal features, such as model authenticat
 option(MNN_JNI "Build MNN Jni for java to use" OFF)
 option(MNN_SUPPORT_BF16 "Enable MNN's bf16 op" OFF)
 option(MNN_LOW_MEMORY "Build MNN support low memory for weight quant model." OFF)
-option(MNN_CPU_WEIGHT_DEQUANT_GEMM "Build MNN CPU weight dequant related gemm kernels." OFF)
 option(MNN_BUILD_AUDIO "Build audio api in MNN." OFF)
 option(MNN_SME2 "Use Arm sme2 instructions" ON)
 option(MNN_METAL_TENSOR "Use Metal4 tensor instructions" ON)
 option(MNN_GENERATE_PODSPEC "Generate iOS podspec file from CMake configuration" OFF)
+
+# NOTE: MNN_CPU_WEIGHT_DEQUANT_GEMM has been permanently removed.
+# The weight-dequant GEMM kernels (int4/int8) are no longer maintained.
+# Use MNN_LOW_MEMORY for low-memory weight quantization inference instead.
 
 if (MNN_BUILD_MINI)
     set(MNN_SKIPBUILD_GEOMETRY ON CACHE BOOL "<docstring>" FORCE)
@@ -244,6 +248,9 @@ if(MNN_SUPPORT_RENDER)
 endif()
 if(MNN_SUPPORT_TRANSFORMER_FUSE)
     add_definitions(-DMNN_SUPPORT_TRANSFORMER_FUSE)
+    if(MNN_GATED_RMS_NORM)
+        add_definitions(-DMNN_GATED_RMS_NORM)
+    endif()
 endif()
 # debug options
 if(MNN_DEBUG_MEMORY)
@@ -258,6 +265,7 @@ endif()
 
 # backend options
 option(MNN_METAL "Enable Metal" OFF)
+option(MNN_METAL_OP_PROFILE "Enable per-op GPU time profiling for the Metal backend." OFF)
 option(MNN_OPENCL "Enable OpenCL" OFF)
 option(MNN_OPENGL "Enable OpenGL" OFF)
 option(MNN_VULKAN "Enable Vulkan" OFF)
@@ -279,8 +287,12 @@ option(MNN_COREML "Enable CoreML" OFF)
 option(MNN_NNAPI "Enable NNAPI" OFF)
 option(MNN_QNN "Enable QNN" OFF)
 option(MNN_QNN_ONLINE_FINALIZE "Enable QNN Online Finalize" ON)
+option(MNN_RKNN "Enable RKNN runtime and converter support" OFF)
+option(MNN_HEXAGON "Enable Hexagon DSP backend" OFF)
+option(MNN_HEXAGON_ASAN "Enable Hexagon backend internal memory consistency checks" OFF)
 
 option(MNN_GPU_TIME_PROFILE "Enable time profiling for the OpenCL backend and Vulkan backend." OFF)
+option(MNN_GPU_PROFILE_SILENT "When GPU time profiling is enabled, only accumulate total time without printing per-kernel details." OFF)
 
 option(MNN_CUDA_PROFILE "Enable CUDA profile" OFF)
 
@@ -676,11 +688,27 @@ IF(MNN_QNN)
     list(APPEND MNN_OBJECTS_TO_LINK $<TARGET_OBJECTS:MNN_QNN>)
 ENDIF()
 
+# RKNN
+IF(MNN_RKNN)
+    add_definitions(-DMNN_RKNN_ENABLED=1)
+    add_subdirectory(${CMAKE_CURRENT_LIST_DIR}/source/backend/rknn/)
+    list(APPEND MNN_OBJECTS_TO_LINK $<TARGET_OBJECTS:MNN_RKNN>)
+ENDIF()
+    
+IF(MNN_HEXAGON)
+    target_compile_options(MNNCore PRIVATE -DMNN_HEXAGON_ENABLED=1)
+    add_subdirectory(${CMAKE_CURRENT_LIST_DIR}/source/backend/hexagon)
+    list(APPEND MNN_TARGETS MNN_Hexagon)
+    list(APPEND MNN_OBJECTS_TO_LINK $<TARGET_OBJECTS:MNN_Hexagon>)
+ENDIF()
+
 # NEUROPILOT
 IF(MNN_NEUROPILOT)
-    target_compile_options(MNNCore PRIVATE -DMNN_NEUROPILOT=1)
     add_subdirectory(${CMAKE_CURRENT_LIST_DIR}/source/backend/neuropilot)
-    list(APPEND MNN_OBJECTS_TO_LINK $<TARGET_OBJECTS:MNN_NEUROPILOT>)
+    IF(TARGET MNN_NEUROPILOT)
+        target_compile_options(MNNCore PRIVATE -DMNN_NEUROPILOT=1)
+        list(APPEND MNN_OBJECTS_TO_LINK $<TARGET_OBJECTS:MNN_NEUROPILOT>)
+    ENDIF()
 ENDIF()
 
 # Vulkan

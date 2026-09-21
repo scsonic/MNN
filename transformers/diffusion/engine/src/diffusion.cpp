@@ -28,6 +28,7 @@ class Flux2KleinDiffusion;
 #define MNN_OPEN_TIME_TRACE
 #include <MNN/AutoTime.hpp>
 #include <cv/cv.hpp>
+#include "diffusion/wan_diffusion.hpp"
 
 #if defined(_MSC_VER)
 #include <Windows.h>
@@ -184,6 +185,21 @@ void Diffusion::generateLatentNoise(float* dst, int size, int seed) {
     for (int i = 0; i < size; ++i) dst[i] = rng.randn();
 }
 
+bool Diffusion::runVideo(const std::string& prompt, const std::string& outputDir, int width, int height, int frames,
+                         int steps, int seed, float cfgScale, std::function<void(int)> progressCallback) {
+    (void)prompt;
+    (void)outputDir;
+    (void)width;
+    (void)height;
+    (void)frames;
+    (void)steps;
+    (void)seed;
+    (void)cfgScale;
+    (void)progressCallback;
+    MNN_ERROR("This diffusion model does not support video generation.\n");
+    return false;
+}
+
 // ===== Factory Methods =====
 
 Diffusion* Diffusion::createDiffusion(std::string modelPath, DiffusionModelType modelType, MNNForwardType backendType, int memoryMode) {
@@ -195,6 +211,8 @@ Diffusion* Diffusion::createDiffusion(std::string modelPath, DiffusionModelType 
         return new LongCatDiffusion(modelPath, modelType, backendType, memoryMode, 0, 0, true, false, GPU_MEMORY_AUTO, PRECISION_AUTO, CFG_MODE_AUTO, 4);
     } else if (modelType == FLUX2_KLEIN_DIFFUSION) {
         return new Flux2KleinDiffusion(modelPath, modelType, backendType, memoryMode, 0, 0, true, false, GPU_MEMORY_AUTO, PRECISION_AUTO, CFG_MODE_AUTO, 4);
+    } else if (modelType == WAN2_1_T2V) {
+        return new WanDiffusion(modelPath, modelType, backendType, memoryMode);
     } else {
         return new StableDiffusion(modelPath, modelType, backendType, memoryMode);
     }
@@ -209,6 +227,8 @@ Diffusion* Diffusion::createDiffusion(std::string modelPath, DiffusionModelType 
         return new Flux2KleinDiffusion(modelPath, modelType, backendType, memoryMode, imageWidth, imageHeight, textEncoderOnCPU, vaeOnCPU, gpuMemoryMode, precisionMode, cfgMode, numThreads);
     } else if (modelType == SANA_DIFFUSION) {
         return new SanaDiffusion(modelPath, modelType, backendType, memoryMode, imageWidth, imageHeight, textEncoderOnCPU, vaeOnCPU, gpuMemoryMode, precisionMode, cfgMode, numThreads);
+    } else if (modelType == WAN2_1_T2V) {
+        return new WanDiffusion(modelPath, modelType, backendType, memoryMode);
     } else {
         return new StableDiffusion(modelPath, modelType, backendType, memoryMode);
     }
