@@ -125,6 +125,10 @@ bool QwenImage21Diffusion::load() {
     if (!initRuntimeManagers(/*gpuBufferMode=*/true)) {
         return false;
     }
+    // Winograd pre-transforms the VAE's 3x3 weights (up to 1152 channels) into several GB; keep it off.
+    for (auto rt : {runtime_manager_, runtime_manager_cpu_, runtime_manager_vae_cpu_}) {
+        if (rt) rt->setHint(Interpreter::WINOGRAD_MEMORY_LEVEL, 0);
+    }
     if (mMemoryMode == 1) {
         // keep everything resident
         mTxtIn = loadModule("txt_in.mnn", {"txt"}, {"txt_h"}, runtime_manager_);
@@ -351,6 +355,7 @@ VARP QwenImage21Diffusion::denoise(VARP prefixKV, int textLen, int steps, int se
     if (mMemoryMode == 0) {
         mDitStep.reset();
         mImgIn.reset();
+        ExecutorScope::Current()->gc(Executor::FULL);
     }
     dump("latents", latents.data(), latents.size());
     return hostTensor({1, N, kLatentC}, latents.data());
@@ -374,7 +379,9 @@ VARP QwenImage21Diffusion::decode(VARP packedLatents) {
     auto out = mVae->onForward({hostTensor({1, kLatentC, mLatentH, mLatentW}, nchw.data())});
     if (out.empty()) return nullptr;
     auto img = hostCopy(out[0]);
-    MNN_PRINT("[QwenImage21] vae decode %.2f s\n", (nowUs() - st) / 1e6);
+    float memMB = 0.0f;
+    vaeRt->getInfo(Interpreter::MEMORY, &memMB);
+    MNN_PRINT("[QwenImage21] vae decode %.2f s, runtime memory %.0f MB\n", (nowUs() - st) / 1e6, memMB);
     if (mMemoryMode != 1) mVae.reset();
     return img;
 }
