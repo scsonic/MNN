@@ -402,7 +402,9 @@ bool Llm::load() {
         needHiddenState = true;
     }
     if (needHiddenState) {
-        outputNames.emplace_back("hidden_states");
+        // "hidden_states_output" picks another graph tensor as the hidden-state output, e.g. the last decoder
+        // layer's residual before the final norm, which diffusion text encoders (Qwen-Image) consume.
+        outputNames.emplace_back(mConfig->config_.value("hidden_states_output", std::string("hidden_states")));
     }
 
     mRuntimeManager->setExternalFile(weight_path);
@@ -653,7 +655,7 @@ std::vector<Express::VARP> Llm::forwardRaw(Express::VARP hiddenState, Express::V
         }
     }
     // Save hidden_states to file for LongCat text encoder
-    if (mConfig->config_.value("hidden_states", false)) {
+    if (mConfig->config_.value("hidden_states", false) && !mConfig->config_.contains("hidden_states_output")) {
         int hsIndex = mConfig->has_talker() ? 2 : 1;
         if (outputs.size() > hsIndex) {
             auto hs = outputs[hsIndex];

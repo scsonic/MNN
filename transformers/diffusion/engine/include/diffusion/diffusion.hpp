@@ -135,6 +135,7 @@ typedef enum {
     LONGCAT_IMAGE_EDIT = 4,
     FLUX2_KLEIN_DIFFUSION = 5,
     WAN2_1_T2V = 6,
+    QWEN_IMAGE_21 = 7,
     DIFFUSION_MODEL_USER
 } DiffusionModelType;
 

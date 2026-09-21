@@ -52,6 +52,9 @@ if (MNN_BUILD_LLM)
 
     add_executable(wan_diffusion_demo ${CMAKE_CURRENT_LIST_DIR}/wan_diffusion_demo.cpp)
     target_link_libraries(wan_diffusion_demo ${MNN_DEPS})
+
+    add_executable(qwen_image21_demo ${CMAKE_CURRENT_LIST_DIR}/qwen_image21_demo.cpp)
+    target_link_libraries(qwen_image21_demo ${MNN_DEPS})
 endif()
 
 add_executable(diffusion_sd35_demo ${CMAKE_CURRENT_LIST_DIR}/diffusion_sd35_demo.cpp)

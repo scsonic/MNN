@@ -24,6 +24,7 @@ class Flux2KleinDiffusion;
 #include "diffusion/zimage_diffusion.hpp"
 #include "diffusion/longcat_diffusion.hpp"
 #include "diffusion/flux2_klein_diffusion.hpp"
+#include "diffusion/qwen_image21_diffusion.hpp"
 
 #define MNN_OPEN_TIME_TRACE
 #include <MNN/AutoTime.hpp>
@@ -213,6 +214,8 @@ Diffusion* Diffusion::createDiffusion(std::string modelPath, DiffusionModelType 
         return new Flux2KleinDiffusion(modelPath, modelType, backendType, memoryMode, 0, 0, true, false, GPU_MEMORY_AUTO, PRECISION_AUTO, CFG_MODE_AUTO, 4);
     } else if (modelType == WAN2_1_T2V) {
         return new WanDiffusion(modelPath, modelType, backendType, memoryMode);
+    } else if (modelType == QWEN_IMAGE_21) {
+        return new QwenImage21Diffusion(modelPath, modelType, backendType, memoryMode, 512, 512, true, false, GPU_MEMORY_AUTO, PRECISION_AUTO, CFG_MODE_AUTO, 4);
     } else {
         return new StableDiffusion(modelPath, modelType, backendType, memoryMode);
     }
@@ -229,6 +232,8 @@ Diffusion* Diffusion::createDiffusion(std::string modelPath, DiffusionModelType 
         return new SanaDiffusion(modelPath, modelType, backendType, memoryMode, imageWidth, imageHeight, textEncoderOnCPU, vaeOnCPU, gpuMemoryMode, precisionMode, cfgMode, numThreads);
     } else if (modelType == WAN2_1_T2V) {
         return new WanDiffusion(modelPath, modelType, backendType, memoryMode);
+    } else if (modelType == QWEN_IMAGE_21) {
+        return new QwenImage21Diffusion(modelPath, modelType, backendType, memoryMode, imageWidth, imageHeight, textEncoderOnCPU, vaeOnCPU, gpuMemoryMode, precisionMode, cfgMode, numThreads);
     } else {
         return new StableDiffusion(modelPath, modelType, backendType, memoryMode);
     }
