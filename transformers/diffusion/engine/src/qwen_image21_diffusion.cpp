@@ -36,6 +36,7 @@ constexpr int kHeadDim = 128;
 constexpr int kDim = 4096;
 constexpr int kLatentC = 64;
 constexpr float kMaskNeg = -30000.0f;
+constexpr int kImagePadId = 151655;  // <|image_pad|>
 const char* kSystemPrompt = "Comprehend and analyze the provided prompt.";
 
 int64_t nowUs() {
@@ -125,6 +126,29 @@ bool QwenImage21Diffusion::load() {
     if (!initRuntimeManagers(/*gpuBufferMode=*/true)) {
         return false;
     }
+    if (mBackendType == MNN_FORWARD_CPU) {
+        // CPU Memory_Low routes quantized convs through dynamic int8 GEMM, which returned garbage for long
+        // prefixes (edit mode, P ~ 1000) on SME2 hosts; use Memory_Normal for the CPU DiT.
+        ScheduleConfig config;
+        BackendConfig bc;
+        config.type = MNN_FORWARD_CPU;
+        config.numThread = mNumThreads;
+        bc.memory = BackendConfig::Memory_Normal;
+        bc.precision = mPrecisionMode == PRECISION_LOW ? BackendConfig::Precision_Low : BackendConfig::Precision_High;
+        config.backendConfig = &bc;
+        runtime_manager_.reset(Executor::RuntimeManager::createRuntimeManager(config));
+    }
+    if (runtime_manager_vae_cpu_) {
+        // The exported VAE is fp16-safe (rescaled residual stream); fp16 halves its CPU memory (~2.5 GB at 512^2).
+        ScheduleConfig config;
+        BackendConfig bc;
+        config.type = MNN_FORWARD_CPU;
+        config.numThread = mNumThreads;
+        bc.memory = BackendConfig::Memory_Low;
+        bc.precision = BackendConfig::Precision_Low;
+        config.backendConfig = &bc;
+        runtime_manager_vae_cpu_.reset(Executor::RuntimeManager::createRuntimeManager(config));
+    }
     // Winograd pre-transforms the VAE's 3x3 weights (up to 1152 channels) into several GB; keep it off.
     for (auto rt : {runtime_manager_, runtime_manager_cpu_, runtime_manager_vae_cpu_}) {
         if (rt) rt->setHint(Interpreter::WINOGRAD_MEMORY_LEVEL, 0);
@@ -208,35 +232,54 @@ VARP QwenImage21Diffusion::encodePrompt(const std::string& prompt) {
 
 // ---------------------------------------------------------------------------------------------- DiT
 
-void QwenImage21Diffusion::ropeTables(int textLen, int hTokens, int wTokens, std::vector<float>& cosTab,
-                                      std::vector<float>& sinTab) {
+void QwenImage21Diffusion::ropeFromPositions(const std::vector<int>& frame, const std::vector<int>& hpos,
+                                             const std::vector<int>& wpos, std::vector<float>& cosTab,
+                                             std::vector<float>& sinTab) {
     // QwenImage21Rope: axes (frame 16, height 56, width 56), theta 10000, interleaved complex pairs.
     const int axes[3] = {16, 56, 56};
-    int n = textLen + hTokens * wTokens;
-    cosTab.resize((size_t)n * 64);
-    sinTab.resize((size_t)n * 64);
-    auto fill = [&](int row, int f, int hh, int ww) {
-        int pos[3] = {f, hh, ww};
+    size_t n = frame.size();
+    cosTab.resize(n * 64);
+    sinTab.resize(n * 64);
+    for (size_t row = 0; row < n; ++row) {
+        int pos[3] = {frame[row], hpos[row], wpos[row]};
         int col = 0;
         for (int a = 0; a < 3; ++a) {
             for (int i = 0; i < axes[a] / 2; ++i) {
-                double inv = 1.0 / std::pow(10000.0, (2.0 * i) / axes[a]);
-                double ang = pos[a] * inv;
-                cosTab[(size_t)row * 64 + col] = (float)std::cos(ang);
-                sinTab[(size_t)row * 64 + col] = (float)std::sin(ang);
+                double ang = pos[a] / std::pow(10000.0, (2.0 * i) / axes[a]);
+                cosTab[row * 64 + col] = (float)std::cos(ang);
+                sinTab[row * 64 + col] = (float)std::sin(ang);
                 ++col;
             }
         }
-    };
-    for (int i = 0; i < textLen; ++i) {
-        fill(i, i, i, i);
     }
-    int row = textLen;
-    for (int h = -(hTokens - hTokens / 2); h < hTokens / 2; ++h) {
-        for (int w = -(wTokens - wTokens / 2); w < wTokens / 2; ++w) {
-            fill(row++, textLen, h, w);
+}
+
+namespace {
+// Centered latent grid positions of one image block (QwenImage21Rope).
+void appendGrid(int frameValue, int h, int w, std::vector<int>& f, std::vector<int>& hp, std::vector<int>& wp) {
+    for (int y = -(h - h / 2); y < h / 2; ++y) {
+        for (int x = -(w - w / 2); x < w / 2; ++x) {
+            f.push_back(frameValue);
+            hp.push_back(y);
+            wp.push_back(x);
         }
     }
+}
+void appendText(int start, int count, std::vector<int>& f, std::vector<int>& hp, std::vector<int>& wp) {
+    for (int i = 0; i < count; ++i) {
+        f.push_back(start + i);
+        hp.push_back(start + i);
+        wp.push_back(start + i);
+    }
+}
+} // namespace
+
+void QwenImage21Diffusion::ropeTables(int textLen, int hTokens, int wTokens, std::vector<float>& cosTab,
+                                      std::vector<float>& sinTab) {
+    std::vector<int> f, hp, wp;
+    appendText(0, textLen, f, hp, wp);
+    appendGrid(textLen, hTokens, wTokens, f, hp, wp);
+    ropeFromPositions(f, hp, wp, cosTab, sinTab);
 }
 
 std::vector<float> QwenImage21Diffusion::sigmas(int steps, int imageSeqLen) {
@@ -258,47 +301,57 @@ std::vector<float> QwenImage21Diffusion::sigmas(int steps, int imageSeqLen) {
     return out;
 }
 
-VARP QwenImage21Diffusion::buildPrefixCache(VARP textHidden) {
+VARP QwenImage21Diffusion::runPrefix(VARP hidden, const std::vector<float>& cosTab, const std::vector<float>& sinTab,
+                                     const std::vector<float>& mask) {
     AUTOTIME;
-    int L = textHidden->getInfo()->dim[1];
-    if (!mTxtIn) {
-        mTxtIn = loadModule("txt_in.mnn", {"txt"}, {"txt_h"}, runtime_manager_);
-    }
-    if (!mTxtIn) return nullptr;
-    auto txtH = mTxtIn->onForward({textHidden});
-    if (txtH.empty()) return nullptr;
-    auto hidden = hostCopy(txtH[0]);
-    if (mMemoryMode != 1) mTxtIn.reset();
-
-    std::vector<float> cosTab, sinTab;
-    ropeTables(L, mLatentH, mLatentW, cosTab, sinTab);
-    std::vector<float> mask((size_t)L * (L + 1), kMaskNeg);
-    for (int q = 0; q < L; ++q) {
-        for (int k = 0; k <= q; ++k) mask[(size_t)q * (L + 1) + 1 + k] = 0.0f;
-    }
+    int P = hidden->getInfo()->dim[1];
     std::vector<float> pastZero((size_t)kLayers * 2 * kHeads * kHeadDim, 0.0f);
     float t0 = 0.0f;
-
     auto prefix = loadModule("dit.mnn", {"hidden", "timestep", "rope_cos", "rope_sin", "past_kv", "attn_mask"},
                              {"present_kv"}, runtime_manager_);
     if (!prefix) return nullptr;
     int64_t st = nowUs();
-    auto out = prefix->onForward({hidden, hostTensor({1}, &t0), hostTensor({L, 64}, cosTab.data()),
-                                  hostTensor({L, 64}, sinTab.data()),
+    auto out = prefix->onForward({hidden, hostTensor({1}, &t0), hostTensor({P, 64}, cosTab.data()),
+                                  hostTensor({P, 64}, sinTab.data()),
                                   hostTensor({kLayers, 2, 1, kHeads, kHeadDim}, pastZero.data()),
-                                  hostTensor({1, 1, L, L + 1}, mask.data())});
+                                  hostTensor({1, 1, P, P + 1}, mask.data())});
     if (out.empty()) return nullptr;
     auto kv = hostCopy(out[0]);
     dump("prefix_kv", kv->readMap<float>(), kv->getInfo()->size);
-    dump("txt_h", hidden->readMap<float>(), hidden->getInfo()->size);
-    MNN_PRINT("[QwenImage21] prefix pass L=%d: %.2f s\n", L, (nowUs() - st) / 1e6);
+    MNN_PRINT("[QwenImage21] prefix pass P=%d: %.2f s\n", P, (nowUs() - st) / 1e6);
     out.clear();
     prefix.reset();
     return kv;
 }
 
-VARP QwenImage21Diffusion::denoise(VARP prefixKV, int textLen, int steps, int seed,
-                                   std::function<void(int)> progressCallback) {
+VARP QwenImage21Diffusion::embedText(VARP textHidden) {
+    if (!mTxtIn) mTxtIn = loadModule("txt_in.mnn", {"txt"}, {"txt_h"}, runtime_manager_);
+    if (!mTxtIn) return nullptr;
+    auto txtH = mTxtIn->onForward({textHidden});
+    if (txtH.empty()) return nullptr;
+    auto hidden = hostCopy(txtH[0]);
+    if (mMemoryMode != 1) mTxtIn.reset();
+    return hidden;
+}
+
+VARP QwenImage21Diffusion::buildPrefixCache(VARP textHidden) {
+    int L = textHidden->getInfo()->dim[1];
+    auto hidden = embedText(textHidden);
+    if (hidden.get() == nullptr) return nullptr;
+    dump("txt_h", hidden->readMap<float>(), hidden->getInfo()->size);
+    std::vector<float> cosTab, sinTab;
+    ropeTables(L, mLatentH, mLatentW, cosTab, sinTab);
+    cosTab.resize((size_t)L * 64);
+    sinTab.resize((size_t)L * 64);
+    std::vector<float> mask((size_t)L * (L + 1), kMaskNeg);
+    for (int q = 0; q < L; ++q) {
+        for (int k = 0; k <= q; ++k) mask[(size_t)q * (L + 1) + 1 + k] = 0.0f;
+    }
+    return runPrefix(hidden, cosTab, sinTab, mask);
+}
+
+VARP QwenImage21Diffusion::denoise(VARP prefixKV, int prefixLen, const float* cosTarget, const float* sinTarget,
+                                   int steps, int seed, std::function<void(int)> progressCallback) {
     AUTOTIME;
     const int N = mLatentH * mLatentW;
     if (!mImgIn) mImgIn = loadModule("img_in.mnn", {"lat"}, {"img_h"}, runtime_manager_);
@@ -308,14 +361,12 @@ VARP QwenImage21Diffusion::denoise(VARP prefixKV, int textLen, int steps, int se
     }
     if (!mImgIn || !mDitStep) return nullptr;
 
-    std::vector<float> cosTab, sinTab;
-    ropeTables(textLen, mLatentH, mLatentW, cosTab, sinTab);
-    auto ropeCos = hostTensor({N, 64}, cosTab.data() + (size_t)textLen * 64);
-    auto ropeSin = hostTensor({N, 64}, sinTab.data() + (size_t)textLen * 64);
+    auto ropeCos = hostTensor({N, 64}, cosTarget);
+    auto ropeSin = hostTensor({N, 64}, sinTarget);
     ropeCos.fix(VARP::CONSTANT);
     ropeSin.fix(VARP::CONSTANT);
-    std::vector<float> zeroMask((size_t)N * (textLen + N), 0.0f);
-    auto mask = hostTensor({1, 1, N, textLen + N}, zeroMask.data());
+    std::vector<float> zeroMask((size_t)N * (prefixLen + N), 0.0f);
+    auto mask = hostTensor({1, 1, N, prefixLen + N}, zeroMask.data());
     mask.fix(VARP::CONSTANT);
 
     std::vector<float> latents((size_t)N * kLatentC);
@@ -328,9 +379,23 @@ VARP QwenImage21Diffusion::denoise(VARP prefixKV, int textLen, int steps, int se
         int64_t st = nowUs();
         ::memcpy(latVar->writeMap<float>(), latents.data(), latents.size() * sizeof(float));
         tVar->writeMap<float>()[0] = sig[i];
-        auto imgH = mImgIn->onForward({latVar});
-        if (imgH.empty()) return nullptr;
-        auto out = mDitStep->onForward({imgH[0], tVar, ropeCos, ropeSin, prefixKV, mask});
+        auto imgOut = mImgIn->onForward({latVar});
+        if (imgOut.empty()) return nullptr;
+        // Own copy: feeding another module's output directly lets the DiT reuse that buffer (seen with long prefixes).
+        auto imgH = hostCopy(imgOut[0]);
+        imgOut.clear();
+        if (i == 0 && getenv("QWEN_IMAGE21_DUMP")) {
+            std::vector<VARP> ins = {imgH, tVar, ropeCos, ropeSin, prefixKV, mask};
+            const char* names[] = {"hidden", "timestep", "rope_cos", "rope_sin", "past_kv", "attn_mask"};
+            std::vector<VARP> saved;
+            for (int k = 0; k < 6; ++k) {
+                auto c = hostCopy(ins[k]);
+                c->setName(names[k]);
+                saved.push_back(c);
+            }
+            Variable::save(saved, (std::string(getenv("QWEN_IMAGE21_DUMP")) + "/step_input.mnn").c_str());
+        }
+        auto out = mDitStep->onForward({imgH, tVar, ropeCos, ropeSin, prefixKV, mask});
         if (out.empty()) return nullptr;
         auto v = _Convert(out[0], NCHW);
         const float* vp = v->readMap<float>();
@@ -455,37 +520,330 @@ bool QwenImage21Diffusion::saveRGBA(VARP image, const std::string& path) {
     return writePngRGBA(path, rgba.data(), W, H);
 }
 
+// ---------------------------------------------------------------------------------------------- errors / memory
+
+int QwenImage21Diffusion::availableMemoryMB() {
+#if defined(__ANDROID__) || defined(__linux__)
+    std::ifstream f("/proc/meminfo");
+    std::string key;
+    long value = 0;
+    std::string unit;
+    while (f >> key >> value >> unit) {
+        if (key == "MemAvailable:") return (int)(value / 1024);
+    }
+#endif
+    return -1;
+}
+
+void QwenImage21Diffusion::setImageSize(int width, int height) {
+    mImageWidth = std::max(256, (width / 32) * 32);
+    mImageHeight = std::max(256, (height / 32) * 32);
+}
+
+bool QwenImage21Diffusion::failStage(const char* stage) {
+    int avail = availableMemoryMB();
+    bool oom = avail >= 0 && avail < 1500;
+    char buf[256];
+    snprintf(buf, sizeof(buf), "%s failed%s (available memory %d MB)", stage, oom ? ": out of memory" : "", avail);
+    return fail(oom ? kOutOfMemory : kRuntimeError, buf);
+}
+
+bool QwenImage21Diffusion::fail(int code, const std::string& message) {
+    mErrorCode = code;
+    mError = message;
+    MNN_ERROR("[QwenImage21] %s\n", message.c_str());
+    releaseAll();
+    return false;
+}
+
+void QwenImage21Diffusion::releaseAll() {
+    mTextEncoder.reset();
+    mTxtIn.reset();
+    mImgIn.reset();
+    mDitStep.reset();
+    mVae.reset();
+    ExecutorScope::Current()->gc(Executor::FULL);
+}
+
+namespace {
+// Rough peak RAM per stage (MB), measured on Snapdragon 8 Gen 2 / Apple M-series.
+int teNeedMB(bool vision) { return vision ? 6100 : 5600; }
+int ditNeedMB(int prefixLen, int tokens) { return 5000 + (prefixLen + tokens) / 2; }
+int vaeDecodeNeedMB(int w, int h) { return (int)(2800.0 * w * h / 262144.0); }
+int vaeEncodeNeedMB(int w, int h) { return (int)(1200.0 * w * h / 262144.0); }
+} // namespace
+
+bool QwenImage21Diffusion::ensureMemory(const char* stage, int needMB) {
+    const int marginMB = 400;
+    int avail = availableMemoryMB();
+    MNN_PRINT("[QwenImage21] %s: needs ~%d MB, available %d MB\n", stage, needMB, avail);
+    if (avail >= 0 && avail < needMB + marginMB) {
+        char buf[256];
+        snprintf(buf, sizeof(buf), "Out of memory before %s: needs about %d MB, only %d MB available", stage, needMB,
+                 avail);
+        return fail(kOutOfMemory, buf);
+    }
+    return true;
+}
+
+// ---------------------------------------------------------------------------------------------- edit
+
+void QwenImage21Diffusion::editSize(int srcW, int srcH, int& w, int& h) const {
+    // diffusers calculate_dimensions(output_resolution^2, ratio): keep the area, round each side to 32.
+    double area = (double)mImageWidth * mImageHeight;
+    double ratio = (double)srcW / srcH;
+    double fw = std::sqrt(area * ratio);
+    w = std::max(256, (int)std::lround(fw / 32.0) * 32);
+    h = std::max(256, (int)std::lround(fw / ratio / 32.0) * 32);
+}
+
+VARP QwenImage21Diffusion::encodeEditPrompt(const std::string& prompt, VARP bgr, int w, int h,
+                                            std::vector<char>& isPad) {
+    AUTOTIME;
+    // Qwen3-VL with the vision tower: the condition image is read as vision context.
+    std::string cfg = mModelPath + "/text_encoder/te_vl_config.json";
+    std::shared_ptr<Transformer::Llm> te(Transformer::Llm::createLLM(cfg), Transformer::Llm::destroy);
+    if (!te) {
+        MNN_ERROR("[QwenImage21] cannot create text encoder from %s\n", cfg.c_str());
+        return nullptr;
+    }
+    std::string backend = (mTextEncoderOnCPU || mBackendType == MNN_FORWARD_CPU) ? "cpu" : "opencl";
+    te->set_config("{\"backend_type\":\"" + backend + "\",\"thread_num\":" +
+                   std::to_string(backend == "cpu" ? mNumThreads : 68) + "}");
+    if (!te->load()) {
+        MNN_ERROR("[QwenImage21] text encoder (vision) load failed; is text_encoder/visual.mnn present?\n");
+        return nullptr;
+    }
+    Transformer::MultimodalPrompt mp;
+    // QwenImage21Pipeline.prompt_template_ti2i; <img>..</img> expands to <|vision_start|><|image_pad|>*n<|vision_end|>
+    mp.prompt_template = std::string("<|im_start|>system\n") + kSystemPrompt + "<|im_end|>\n<|im_start|>user\n" +
+                         "<image1><img>cond</img>" + (prompt.empty() ? std::string(" ") : prompt) +
+                         "<|im_end|>\n<|im_start|>assistant\n";
+    mp.images["cond"] = Transformer::PromptImagePart{bgr, w, h};
+    auto ids = te->tokenizer_encode(mp);
+    if ((int)ids.size() <= mDropIdx || te->forward(ids) == nullptr) {
+        MNN_ERROR("[QwenImage21] text encoder (vision) forward failed\n");
+        return nullptr;
+    }
+    VARP result;
+    {
+        auto outputs = te->getOutputs();
+        int index = te->getOutputIndex(mTeOutputName);
+        if (index < 0 || index >= (int)outputs.size()) {
+            MNN_ERROR("[QwenImage21] text encoder has no output %s\n", mTeOutputName.c_str());
+            return nullptr;
+        }
+        auto hidden = _Convert(outputs[index], NCHW);
+        int T = hidden->getInfo()->dim[1];
+        int L = T - mDropIdx;
+        std::vector<float> host((size_t)L * kDim);
+        ::memcpy(host.data(), hidden->readMap<float>() + (size_t)mDropIdx * kDim, host.size() * sizeof(float));
+        isPad.resize(L);
+        for (int i = 0; i < L; ++i) isPad[i] = ids[mDropIdx + i] == kImagePadId;
+        hidden = nullptr;
+        outputs.clear();
+        te->reset();
+        ExecutorScope scope(Executor::getGlobalExecutor());
+        result = _Input({1, L, kDim}, NCHW, halide_type_of<float>());
+        ::memcpy(result->writeMap<float>(), host.data(), host.size() * sizeof(float));
+        result.fix(VARP::CONSTANT);
+    }
+    te.reset();
+    return result;
+}
+
+VARP QwenImage21Diffusion::encodeImage(VARP rgb, int w, int h) {
+    AUTOTIME;
+    auto rt = runtime_manager_vae_cpu_ ? runtime_manager_vae_cpu_ : runtime_manager_;
+    auto enc = loadModule("vae_encoder.mnn", {"image"}, {"latent"}, rt);
+    if (!enc) return nullptr;
+    // RGB uint8 HWC -> RGBA float NCHW in [-1, 1] (opaque alpha)
+    const uint8_t* src = rgb->readMap<uint8_t>();
+    std::vector<float> rgba((size_t)4 * h * w);
+    for (int i = 0; i < h * w; ++i) {
+        for (int c = 0; c < 3; ++c) rgba[(size_t)c * h * w + i] = src[i * 3 + c] / 127.5f - 1.0f;
+        rgba[(size_t)3 * h * w + i] = 1.0f;
+    }
+    dump("edit_rgba", rgba.data(), rgba.size());
+    int64_t st = nowUs();
+    auto out = enc->onForward({hostTensor({1, 4, h, w}, rgba.data())});
+    if (out.empty()) return nullptr;
+    auto lat = _Convert(out[0], NCHW);  // [1, 64, h/16, w/16]
+    int hc = h / 16, wc = w / 16, N = hc * wc;
+    const float* lp = lat->readMap<float>();
+    std::vector<float> packed((size_t)N * kLatentC);
+    for (int c = 0; c < kLatentC; ++c) {
+        for (int n = 0; n < N; ++n) packed[(size_t)n * kLatentC + c] = lp[(size_t)c * N + n];
+    }
+    MNN_PRINT("[QwenImage21] vae encode %dx%d: %.2f s\n", w, h, (nowUs() - st) / 1e6);
+    out.clear();
+    lat = nullptr;
+    enc.reset();
+    return hostTensor({1, N, kLatentC}, packed.data());
+}
+
+bool QwenImage21Diffusion::runEdit(const std::string& prompt, const std::string& inputImagePath,
+                                   const std::string& outputPath, int steps, int seed,
+                                   std::function<void(int)> progressCallback) {
+    AUTOTIME;
+    int64_t st = nowUs();
+    auto src = imread(inputImagePath);
+    if (src.get() == nullptr || src->getInfo() == nullptr) {
+        return fail(kModelError, "cannot read input image " + inputImagePath);
+    }
+    int srcH = src->getInfo()->dim[0], srcW = src->getInfo()->dim[1];
+    int w, h;
+    editSize(srcW, srcH, w, h);
+    mLatentW = w / 16;
+    mLatentH = h / 16;
+    // imread + resize hand back RGB-ordered pixels here (verified against PIL); Omni expects BGR input.
+    auto rgb = resize(src, {w, h}, 0, 0, INTER_CUBIC);
+    rgb.fix(VARP::CONSTANT);
+    auto bgr = cvtColor(rgb, COLOR_RGB2BGR);
+    bgr.fix(VARP::CONSTANT);
+    MNN_PRINT("[QwenImage21] edit: input %dx%d -> %dx%d\n", srcW, srcH, w, h);
+
+    std::vector<char> isPad;
+    if (!ensureMemory("text encoder", teNeedMB(true))) return false;
+    auto text = encodeEditPrompt(prompt, bgr, w, h, isPad);
+    if (text.get() == nullptr) return failStage("text encoder (vision)");
+    if (progressCallback) progressCallback(3);
+    if (!ensureMemory("VAE encoder", vaeEncodeNeedMB(w, h))) return false;
+    auto cond = encodeImage(rgb, w, h);
+    if (cond.get() == nullptr) return failStage("VAE encoder");
+    if (progressCallback) progressCallback(5);
+
+    // Layout [t1 text][condition latents][t2 text] + target, see export/qwen_image21_mnn.py:edit_layout
+    const int hc = mLatentH, wc = mLatentW, nc = hc * wc;
+    int L = (int)isPad.size();
+    int first = -1, nslots = 0;
+    for (int i = 0; i < L; ++i) {
+        if (isPad[i]) {
+            if (first < 0) first = i;
+            ++nslots;
+        }
+    }
+    if (first < 0 || nslots * 4 != nc) {
+        char buf[160];
+        snprintf(buf, sizeof(buf), "vision slots %d do not match %dx%d latent tokens", nslots, hc, wc);
+        return fail(kRuntimeError, buf);
+    }
+    const int t1 = first, t2 = L - first - nslots, P = t1 + nc + t2;
+    {
+        dump("edit_text_hidden", text->readMap<float>(), (size_t)L * kDim);
+        std::vector<float> padf(isPad.begin(), isPad.end());
+        dump("edit_is_pad", padf.data(), padf.size());
+        dump("edit_cond", cond->readMap<float>(), (size_t)nc * kLatentC);
+    }
+
+    // text rows without the image slots -> txt_in; condition latents -> img_in
+    std::vector<float> textRows((size_t)(t1 + t2) * kDim);
+    const float* tp = text->readMap<float>();
+    ::memcpy(textRows.data(), tp, (size_t)t1 * kDim * sizeof(float));
+    ::memcpy(textRows.data() + (size_t)t1 * kDim, tp + (size_t)(first + nslots) * kDim, (size_t)t2 * kDim * sizeof(float));
+    if (!ensureMemory("DiT", ditNeedMB(P, mLatentH * mLatentW))) return false;
+    auto txtH = embedText(hostTensor({1, t1 + t2, kDim}, textRows.data()));
+    if (txtH.get() == nullptr) return failStage("text projection");
+    if (!mImgIn) mImgIn = loadModule("img_in.mnn", {"lat"}, {"img_h"}, runtime_manager_);
+    std::vector<float> condHost(cond->readMap<float>(), cond->readMap<float>() + (size_t)nc * kLatentC);
+    auto condIn = _Input({1, nc, kLatentC}, NCHW, halide_type_of<float>());
+    ::memcpy(condIn->writeMap<float>(), condHost.data(), condHost.size() * sizeof(float));
+    auto condOut = mImgIn->onForward({condIn});
+    if (condOut.empty()) return failStage("image projection");
+    auto condH = hostCopy(condOut[0]);
+    condOut.clear();
+    std::vector<float> prefix((size_t)P * kDim);
+    const float* th = txtH->readMap<float>();
+    ::memcpy(prefix.data(), th, (size_t)t1 * kDim * sizeof(float));
+    ::memcpy(prefix.data() + (size_t)t1 * kDim, condH->readMap<float>(), (size_t)nc * kDim * sizeof(float));
+    ::memcpy(prefix.data() + (size_t)(t1 + nc) * kDim, th + (size_t)t1 * kDim, (size_t)t2 * kDim * sizeof(float));
+
+    std::vector<int> f, hp, wp;
+    appendText(0, t1, f, hp, wp);
+    appendGrid(t1, hc, wc, f, hp, wp);
+    int start2 = t1 + std::max(hc, wc);
+    appendText(start2, t2, f, hp, wp);
+    appendGrid(start2 + t2, mLatentH, mLatentW, f, hp, wp);
+    std::vector<float> cosTab, sinTab;
+    ropeFromPositions(f, hp, wp, cosTab, sinTab);
+    // block-causal: causal everywhere, bidirectional inside the condition image; key 0 is the masked dummy
+    std::vector<float> mask((size_t)P * (P + 1), kMaskNeg);
+    for (int q = 0; q < P; ++q) {
+        bool qImg = q >= t1 && q < t1 + nc;
+        for (int k = 0; k < P; ++k) {
+            bool kImg = k >= t1 && k < t1 + nc;
+            if (k <= q || (qImg && kImg)) mask[(size_t)q * (P + 1) + 1 + k] = 0.0f;
+        }
+    }
+    std::vector<float> cosP(cosTab.begin(), cosTab.begin() + (size_t)P * 64);
+    std::vector<float> sinP(sinTab.begin(), sinTab.begin() + (size_t)P * 64);
+    dump("edit_cond_h", condH->readMap<float>(), (size_t)nc * kDim);
+    dump("edit_prefix", prefix.data(), prefix.size());
+    auto kv = runPrefix(hostTensor({1, P, kDim}, prefix.data()), cosP, sinP, mask);
+    if (kv.get() == nullptr) return failStage("DiT prefix");
+    if (progressCallback) progressCallback(10);
+    auto latents = denoise(kv, P, cosTab.data() + (size_t)P * 64, sinTab.data() + (size_t)P * 64, steps, seed,
+                           progressCallback);
+    kv = nullptr;
+    if (latents.get() == nullptr) return failStage("DiT denoising");
+    if (!ensureMemory("VAE decoder", vaeDecodeNeedMB(w, h))) return false;
+    auto image = decode(latents);
+    if (image.get() == nullptr) return failStage("VAE decoder");
+    bool ok = saveRGBA(image, outputPath);
+    if (!ok) fail(kRuntimeError, "cannot write " + outputPath);
+    MNN_PRINT("[QwenImage21] edit %s %s (seed %d, total %.1f s)\n", ok ? "saved" : "FAILED to save",
+              outputPath.c_str(), seed, (nowUs() - st) / 1e6);
+    if (progressCallback) progressCallback(100);
+    return ok;
+}
+
 // ---------------------------------------------------------------------------------------------- run
 
 bool QwenImage21Diffusion::run(const std::string prompt, const std::string outputPath, int iterNum, int randomSeed,
                                float cfgScale, std::function<void(int)> progressCallback, const std::string inputImagePath) {
     AUTOTIME;
+    mErrorCode = kOk;
+    mError.clear();
     try {
         if (iterNum < 1) iterNum = 20;
         if (iterNum > 100) iterNum = 100;
         int seed = randomSeed < 0 ? (int)(nowUs() & 0x7fffffff) : randomSeed;
+        if (!inputImagePath.empty()) {
+            return runEdit(prompt, inputImagePath, outputPath, iterNum, seed, progressCallback);
+        }
+        mLatentW = mImageWidth / 16;
+        mLatentH = mImageHeight / 16;
+        const int N = mLatentH * mLatentW;
         int64_t st = nowUs();
+        if (!ensureMemory("text encoder", teNeedMB(false))) return false;
         auto text = encodePrompt(prompt);
-        if (text.get() == nullptr) return false;
+        if (text.get() == nullptr) return failStage("text encoder");
         int L = text->getInfo()->dim[1];
         MNN_PRINT("[QwenImage21] text encoder done: %.2f s\n", (nowUs() - st) / 1e6);
         if (progressCallback) progressCallback(5);
+        if (!ensureMemory("DiT", ditNeedMB(L, N))) return false;
         auto kv = buildPrefixCache(text);
-        if (kv.get() == nullptr) return false;
+        if (kv.get() == nullptr) return failStage("DiT prefix");
         if (progressCallback) progressCallback(10);
-        auto latents = denoise(kv, L, iterNum, seed, progressCallback);
+        std::vector<float> cosTab, sinTab;
+        ropeTables(L, mLatentH, mLatentW, cosTab, sinTab);
+        auto latents = denoise(kv, L, cosTab.data() + (size_t)L * 64, sinTab.data() + (size_t)L * 64, iterNum, seed,
+                               progressCallback);
         kv = nullptr;
-        if (latents.get() == nullptr) return false;
+        if (latents.get() == nullptr) return failStage("DiT denoising");
+        if (!ensureMemory("VAE decoder", vaeDecodeNeedMB(mImageWidth, mImageHeight))) return false;
         auto image = decode(latents);
-        if (image.get() == nullptr) return false;
+        if (image.get() == nullptr) return failStage("VAE decoder");
         bool ok = saveRGBA(image, outputPath);
+        if (!ok) fail(kRuntimeError, "cannot write " + outputPath);
         MNN_PRINT("[QwenImage21] %s %s (seed %d, total %.1f s)\n", ok ? "saved" : "FAILED to save",
                   outputPath.c_str(), seed, (nowUs() - st) / 1e6);
         if (progressCallback) progressCallback(100);
         return ok;
+    } catch (const std::bad_alloc&) {
+        return fail(kOutOfMemory, "Out of memory (allocation failed)");
     } catch (const std::exception& e) {
-        MNN_ERROR("[QwenImage21] exception: %s\n", e.what());
-        return false;
+        return fail(kRuntimeError, std::string("exception: ") + e.what());
     }
 }
 
