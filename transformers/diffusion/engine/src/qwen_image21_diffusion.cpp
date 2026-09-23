@@ -301,24 +301,39 @@ std::vector<float> QwenImage21Diffusion::sigmas(int steps, int imageSeqLen) {
     return out;
 }
 
-VARP QwenImage21Diffusion::runPrefix(VARP hidden, const std::vector<float>& cosTab, const std::vector<float>& sinTab,
-                                     const std::vector<float>& mask) {
+// The K/V cache is one tensor per layer ("past_kv_0".."past_kv_31"), not a single [32,2,P,...] blob: that blob is
+// exactly 1 MiB per prefix token, so an image-edit prefix (P > 1000) exceeds OpenCL's CL_DEVICE_MAX_MEM_ALLOC_SIZE
+// (1 GiB on Adreno 740) and the host-staging buffer fails to allocate. Per layer it is P/32 MiB.
+std::vector<std::string> QwenImage21Diffusion::kvNames(const char* prefix) {
+    std::vector<std::string> names(kLayers);
+    for (int i = 0; i < kLayers; ++i) names[i] = std::string(prefix) + std::to_string(i);
+    return names;
+}
+
+std::vector<VARP> QwenImage21Diffusion::runPrefix(VARP hidden, const std::vector<float>& cosTab,
+                                                  const std::vector<float>& sinTab, const std::vector<float>& mask) {
     AUTOTIME;
     int P = hidden->getInfo()->dim[1];
-    std::vector<float> pastZero((size_t)kLayers * 2 * kHeads * kHeadDim, 0.0f);
+    std::vector<float> pastZero((size_t)2 * kHeads * kHeadDim, 0.0f);
     float t0 = 0.0f;
-    auto prefix = loadModule("dit.mnn", {"hidden", "timestep", "rope_cos", "rope_sin", "past_kv", "attn_mask"},
-                             {"present_kv"}, runtime_manager_);
-    if (!prefix) return nullptr;
+    auto inputNames = kvNames("past_kv_");
+    inputNames.insert(inputNames.begin(), {"hidden", "timestep", "rope_cos", "rope_sin", "attn_mask"});
+    auto prefix = loadModule("dit.mnn", inputNames, kvNames("present_kv_"), runtime_manager_);
+    if (!prefix) return {};
+    std::vector<VARP> ins = {hidden, hostTensor({1}, &t0), hostTensor({P, 64}, cosTab.data()),
+                             hostTensor({P, 64}, sinTab.data()), hostTensor({1, 1, P, P + 1}, mask.data())};
+    for (int i = 0; i < kLayers; ++i) ins.push_back(hostTensor({2, 1, kHeads, kHeadDim}, pastZero.data()));
     int64_t st = nowUs();
-    auto out = prefix->onForward({hidden, hostTensor({1}, &t0), hostTensor({P, 64}, cosTab.data()),
-                                  hostTensor({P, 64}, sinTab.data()),
-                                  hostTensor({kLayers, 2, 1, kHeads, kHeadDim}, pastZero.data()),
-                                  hostTensor({1, 1, P, P + 1}, mask.data())});
-    if (out.empty()) return nullptr;
-    auto kv = hostCopy(out[0]);
-    dump("prefix_kv", kv->readMap<float>(), kv->getInfo()->size);
-    MNN_PRINT("[QwenImage21] prefix pass P=%d: %.2f s\n", P, (nowUs() - st) / 1e6);
+    auto out = prefix->onForward(ins);
+    if (out.size() != (size_t)kLayers) return {};
+    std::vector<VARP> kv(kLayers);
+    for (int i = 0; i < kLayers; ++i) {
+        kv[i] = hostCopy(out[i]);
+        if (kv[i].get() == nullptr) return {};
+        dump(("prefix_kv_" + std::to_string(i)).c_str(), kv[i]->readMap<float>(), kv[i]->getInfo()->size);
+    }
+    MNN_PRINT("[QwenImage21] prefix pass P=%d: %.2f s (K/V cache %d MB)\n", P, (nowUs() - st) / 1e6,
+              (int)((size_t)kLayers * 2 * P * kHeads * kHeadDim * sizeof(float) / (1 << 20)));
     out.clear();
     prefix.reset();
     return kv;
@@ -334,10 +349,10 @@ VARP QwenImage21Diffusion::embedText(VARP textHidden) {
     return hidden;
 }
 
-VARP QwenImage21Diffusion::buildPrefixCache(VARP textHidden) {
+std::vector<VARP> QwenImage21Diffusion::buildPrefixCache(VARP textHidden) {
     int L = textHidden->getInfo()->dim[1];
     auto hidden = embedText(textHidden);
-    if (hidden.get() == nullptr) return nullptr;
+    if (hidden.get() == nullptr) return {};
     dump("txt_h", hidden->readMap<float>(), hidden->getInfo()->size);
     std::vector<float> cosTab, sinTab;
     ropeTables(L, mLatentH, mLatentW, cosTab, sinTab);
@@ -350,14 +365,17 @@ VARP QwenImage21Diffusion::buildPrefixCache(VARP textHidden) {
     return runPrefix(hidden, cosTab, sinTab, mask);
 }
 
-VARP QwenImage21Diffusion::denoise(VARP prefixKV, int prefixLen, const float* cosTarget, const float* sinTarget,
-                                   int steps, int seed, std::function<void(int)> progressCallback) {
+VARP QwenImage21Diffusion::denoise(const std::vector<VARP>& prefixKV, int prefixLen, const float* cosTarget,
+                                   const float* sinTarget, int steps, int seed,
+                                   std::function<void(int)> progressCallback) {
     AUTOTIME;
     const int N = mLatentH * mLatentW;
+    if (prefixKV.size() != (size_t)kLayers) return nullptr;
     if (!mImgIn) mImgIn = loadModule("img_in.mnn", {"lat"}, {"img_h"}, runtime_manager_);
     if (!mDitStep) {
-        mDitStep = loadModule("dit.mnn", {"hidden", "timestep", "rope_cos", "rope_sin", "past_kv", "attn_mask"},
-                              {"out"}, runtime_manager_);
+        auto inputNames = kvNames("past_kv_");
+        inputNames.insert(inputNames.begin(), {"hidden", "timestep", "rope_cos", "rope_sin", "attn_mask"});
+        mDitStep = loadModule("dit.mnn", inputNames, {"out"}, runtime_manager_);
     }
     if (!mImgIn || !mDitStep) return nullptr;
 
@@ -384,18 +402,20 @@ VARP QwenImage21Diffusion::denoise(VARP prefixKV, int prefixLen, const float* co
         // Own copy: feeding another module's output directly lets the DiT reuse that buffer (seen with long prefixes).
         auto imgH = hostCopy(imgOut[0]);
         imgOut.clear();
+        std::vector<VARP> ins = {imgH, tVar, ropeCos, ropeSin, mask};
+        ins.insert(ins.end(), prefixKV.begin(), prefixKV.end());
         if (i == 0 && getenv("QWEN_IMAGE21_DUMP")) {
-            std::vector<VARP> ins = {imgH, tVar, ropeCos, ropeSin, prefixKV, mask};
-            const char* names[] = {"hidden", "timestep", "rope_cos", "rope_sin", "past_kv", "attn_mask"};
+            auto names = kvNames("past_kv_");
+            names.insert(names.begin(), {"hidden", "timestep", "rope_cos", "rope_sin", "attn_mask"});
             std::vector<VARP> saved;
-            for (int k = 0; k < 6; ++k) {
+            for (size_t k = 0; k < ins.size(); ++k) {
                 auto c = hostCopy(ins[k]);
                 c->setName(names[k]);
                 saved.push_back(c);
             }
             Variable::save(saved, (std::string(getenv("QWEN_IMAGE21_DUMP")) + "/step_input.mnn").c_str());
         }
-        auto out = mDitStep->onForward({imgH, tVar, ropeCos, ropeSin, prefixKV, mask});
+        auto out = mDitStep->onForward(ins);
         if (out.empty()) return nullptr;
         auto v = _Convert(out[0], NCHW);
         const float* vp = v->readMap<float>();
@@ -569,7 +589,8 @@ namespace {
 // Rough peak RAM per stage (MB), measured on Snapdragon 8 Gen 2 / Apple M-series.
 int teNeedMB(bool vision) { return vision ? 6100 : 5600; }
 int ditNeedMB(int prefixLen, int tokens) { return 5000 + (prefixLen + tokens) / 2; }
-int vaeDecodeNeedMB(int w, int h) { return (int)(2800.0 * w * h / 262144.0); }
+// 448x576 reported 4266 MB of runtime memory on an 8 Gen 2; scaled to 512x512 that is ~4300.
+int vaeDecodeNeedMB(int w, int h) { return (int)(4400.0 * w * h / 262144.0); }
 int vaeEncodeNeedMB(int w, int h) { return (int)(1200.0 * w * h / 262144.0); }
 } // namespace
 
@@ -696,11 +717,13 @@ bool QwenImage21Diffusion::runEdit(const std::string& prompt, const std::string&
     editSize(srcW, srcH, w, h);
     mLatentW = w / 16;
     mLatentH = h / 16;
-    // imread + resize hand back RGB-ordered pixels here (verified against PIL); Omni expects BGR input.
-    auto rgb = resize(src, {w, h}, 0, 0, INTER_CUBIC);
-    rgb.fix(VARP::CONSTANT);
-    auto bgr = cvtColor(rgb, COLOR_RGB2BGR);
+    // imread returns BGR (a pure red PNG reads back as 0,0,255). Omni's vision path takes BGR and converts to RGB
+    // itself; the VAE encoder wants RGB. Getting this backwards tints skin teal in the output, because the model
+    // copies the colours it sees in the condition image.
+    auto bgr = resize(src, {w, h}, 0, 0, INTER_CUBIC);
     bgr.fix(VARP::CONSTANT);
+    auto rgb = cvtColor(bgr, COLOR_BGR2RGB);
+    rgb.fix(VARP::CONSTANT);
     MNN_PRINT("[QwenImage21] edit: input %dx%d -> %dx%d\n", srcW, srcH, w, h);
 
     std::vector<char> isPad;
@@ -780,11 +803,11 @@ bool QwenImage21Diffusion::runEdit(const std::string& prompt, const std::string&
     dump("edit_cond_h", condH->readMap<float>(), (size_t)nc * kDim);
     dump("edit_prefix", prefix.data(), prefix.size());
     auto kv = runPrefix(hostTensor({1, P, kDim}, prefix.data()), cosP, sinP, mask);
-    if (kv.get() == nullptr) return failStage("DiT prefix");
+    if (kv.empty()) return failStage("DiT prefix");
     if (progressCallback) progressCallback(10);
     auto latents = denoise(kv, P, cosTab.data() + (size_t)P * 64, sinTab.data() + (size_t)P * 64, steps, seed,
                            progressCallback);
-    kv = nullptr;
+    kv.clear();
     if (latents.get() == nullptr) return failStage("DiT denoising");
     if (!ensureMemory("VAE decoder", vaeDecodeNeedMB(w, h))) return false;
     auto image = decode(latents);
@@ -823,13 +846,13 @@ bool QwenImage21Diffusion::run(const std::string prompt, const std::string outpu
         if (progressCallback) progressCallback(5);
         if (!ensureMemory("DiT", ditNeedMB(L, N))) return false;
         auto kv = buildPrefixCache(text);
-        if (kv.get() == nullptr) return failStage("DiT prefix");
+        if (kv.empty()) return failStage("DiT prefix");
         if (progressCallback) progressCallback(10);
         std::vector<float> cosTab, sinTab;
         ropeTables(L, mLatentH, mLatentW, cosTab, sinTab);
         auto latents = denoise(kv, L, cosTab.data() + (size_t)L * 64, sinTab.data() + (size_t)L * 64, iterNum, seed,
                                progressCallback);
-        kv = nullptr;
+        kv.clear();
         if (latents.get() == nullptr) return failStage("DiT denoising");
         if (!ensureMemory("VAE decoder", vaeDecodeNeedMB(mImageWidth, mImageHeight))) return false;
         auto image = decode(latents);
