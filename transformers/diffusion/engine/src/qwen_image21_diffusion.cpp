@@ -589,8 +589,9 @@ namespace {
 // Rough peak RAM per stage (MB), measured on Snapdragon 8 Gen 2 / Apple M-series.
 int teNeedMB(bool vision) { return vision ? 6100 : 5600; }
 int ditNeedMB(int prefixLen, int tokens) { return 5000 + (prefixLen + tokens) / 2; }
-// 448x576 reported 4266 MB of runtime memory on an 8 Gen 2; scaled to 512x512 that is ~4300.
-int vaeDecodeNeedMB(int w, int h) { return (int)(4400.0 * w * h / 262144.0); }
+// Runtime memory reported on an 8 Gen 2: 320x320 1985 MB, 512x288 2646 MB, 448x576 4266 MB -> ~500 MB fixed
+// (fp16 weights) plus ~3900 MB per 512x512 of pixels.
+int vaeDecodeNeedMB(int w, int h) { return 500 + (int)(3900.0 * w * h / 262144.0); }
 int vaeEncodeNeedMB(int w, int h) { return (int)(1200.0 * w * h / 262144.0); }
 } // namespace
 
