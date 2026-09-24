@@ -282,20 +282,30 @@ void QwenImage21Diffusion::ropeTables(int textLen, int hTokens, int wTokens, std
     ropeFromPositions(f, hp, wp, cosTab, sinTab);
 }
 
-std::vector<float> QwenImage21Diffusion::sigmas(int steps, int imageSeqLen) {
-    // FlowMatchEulerDiscreteScheduler: exponential time shift (mu from image_seq_len) + shift_terminal 0.02
+std::vector<float> QwenImage21Diffusion::sigmas(int steps, int imageSeqLen, bool turbo) {
+    // FlowMatchEulerDiscreteScheduler: exponential time shift (mu from image_seq_len) + shift_terminal 0.02.
+    // Viggle-turbo ships the same base_shift/max_shift/base_seq/max_seq, but with shift_terminal disabled and
+    // hand-picked raw nodes for its 6-step schedule instead of linspace(1, 1/steps, steps); see
+    // https://huggingface.co/Viggle/Qwen-Image-2.1-viggle-turbo "Rules that matter".
+    static const double kTurboRaw[] = {1.0, 0.9375, 0.875, 0.75, 0.5, 0.25};
+    if (turbo) {
+        steps = 6;
+    }
     const double baseSeq = 256, maxSeq = 8192, baseShift = 0.5, maxShift = 0.9, terminal = 0.02;
     double m = (maxShift - baseShift) / (maxSeq - baseSeq);
     double mu = imageSeqLen * m + baseShift - m * baseSeq;
     std::vector<double> s(steps);
     for (int i = 0; i < steps; ++i) {
-        double lin = steps == 1 ? 1.0 : 1.0 + (1.0 / steps - 1.0) * i / (steps - 1);
+        double lin = turbo ? kTurboRaw[i]
+                           : (steps == 1 ? 1.0 : 1.0 + (1.0 / steps - 1.0) * i / (steps - 1));
         s[i] = std::exp(mu) / (std::exp(mu) + (1.0 / lin - 1.0));
     }
-    double scale = (1.0 - s[steps - 1]) / (1.0 - terminal);
     std::vector<float> out(steps + 1);
-    for (int i = 0; i < steps; ++i) {
-        out[i] = (float)(1.0 - (1.0 - s[i]) / scale);
+    if (turbo) {
+        for (int i = 0; i < steps; ++i) out[i] = (float)s[i];
+    } else {
+        double scale = (1.0 - s[steps - 1]) / (1.0 - terminal);
+        for (int i = 0; i < steps; ++i) out[i] = (float)(1.0 - (1.0 - s[i]) / scale);
     }
     out[steps] = 0.0f;
     return out;
@@ -318,7 +328,7 @@ std::vector<VARP> QwenImage21Diffusion::runPrefix(VARP hidden, const std::vector
     float t0 = 0.0f;
     auto inputNames = kvNames("past_kv_");
     inputNames.insert(inputNames.begin(), {"hidden", "timestep", "rope_cos", "rope_sin", "attn_mask"});
-    auto prefix = loadModule("dit.mnn", inputNames, kvNames("present_kv_"), runtime_manager_);
+    auto prefix = loadModule(mDitFile, inputNames, kvNames("present_kv_"), runtime_manager_);
     if (!prefix) return {};
     std::vector<VARP> ins = {hidden, hostTensor({1}, &t0), hostTensor({P, 64}, cosTab.data()),
                              hostTensor({P, 64}, sinTab.data()), hostTensor({1, 1, P, P + 1}, mask.data())};
@@ -375,7 +385,7 @@ VARP QwenImage21Diffusion::denoise(const std::vector<VARP>& prefixKV, int prefix
     if (!mDitStep) {
         auto inputNames = kvNames("past_kv_");
         inputNames.insert(inputNames.begin(), {"hidden", "timestep", "rope_cos", "rope_sin", "attn_mask"});
-        mDitStep = loadModule("dit.mnn", inputNames, {"out"}, runtime_manager_);
+        mDitStep = loadModule(mDitFile, inputNames, {"out"}, runtime_manager_);
     }
     if (!mImgIn || !mDitStep) return nullptr;
 
@@ -389,7 +399,7 @@ VARP QwenImage21Diffusion::denoise(const std::vector<VARP>& prefixKV, int prefix
 
     std::vector<float> latents((size_t)N * kLatentC);
     generateLatentNoise(latents.data(), (int)latents.size(), seed);
-    auto sig = sigmas(steps, N);
+    auto sig = sigmas(steps, N, mTurbo);
     auto latVar = _Input({1, N, kLatentC}, NCHW, halide_type_of<float>());
     auto tVar = _Input({1}, NCHW, halide_type_of<float>());
 
@@ -553,6 +563,13 @@ int QwenImage21Diffusion::availableMemoryMB() {
     }
 #endif
     return -1;
+}
+
+void QwenImage21Diffusion::setTurbo(bool on) {
+    if (on == mTurbo) return;
+    mTurbo = on;
+    mDitFile = on ? "dit_turbo.mnn" : "dit.mnn";
+    mDitStep.reset();  // force a reload from the new file on the next denoise()
 }
 
 void QwenImage21Diffusion::setImageSize(int width, int height) {
@@ -831,6 +848,7 @@ bool QwenImage21Diffusion::run(const std::string prompt, const std::string outpu
     try {
         if (iterNum < 1) iterNum = 20;
         if (iterNum > 100) iterNum = 100;
+        if (mTurbo) iterNum = 6;  // the LoRA was distilled against exactly this 6-step schedule
         int seed = randomSeed < 0 ? (int)(nowUs() & 0x7fffffff) : randomSeed;
         if (!inputImagePath.empty()) {
             return runEdit(prompt, inputImagePath, outputPath, iterNum, seed, progressCallback);
