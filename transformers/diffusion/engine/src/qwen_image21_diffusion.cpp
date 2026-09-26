@@ -577,6 +577,10 @@ void QwenImage21Diffusion::setImageSize(int width, int height) {
     mImageHeight = std::max(256, (height / 32) * 32);
 }
 
+void QwenImage21Diffusion::setRefAreaScale(double scale) {
+    mRefAreaScale = std::max(1e-3, std::min(1.0, scale));
+}
+
 bool QwenImage21Diffusion::failStage(const char* stage) {
     int avail = availableMemoryMB();
     bool oom = avail >= 0 && avail < 1500;
@@ -636,7 +640,17 @@ void QwenImage21Diffusion::editSize(int srcW, int srcH, int& w, int& h) const {
     h = std::max(256, (int)std::lround(fw / ratio / 32.0) * 32);
 }
 
-VARP QwenImage21Diffusion::encodeEditPrompt(const std::string& prompt, VARP bgr, int w, int h,
+void QwenImage21Diffusion::condSize(int srcW, int srcH, int& w, int& h) const {
+    // Same rule as editSize(), but at mRefAreaScale times the area -- this only shrinks how much of the
+    // reference image the model gets to look at, not the generated image's own size (see setRefAreaScale()).
+    double area = (double)mImageWidth * mImageHeight * mRefAreaScale;
+    double ratio = (double)srcW / srcH;
+    double fw = std::sqrt(area * ratio);
+    w = std::max(256, (int)std::lround(fw / 32.0) * 32);
+    h = std::max(256, (int)std::lround(fw / ratio / 32.0) * 32);
+}
+
+VARP QwenImage21Diffusion::encodeEditPrompt(const std::string& prompt, const std::vector<RefImage>& refs,
                                             std::vector<char>& isPad) {
     AUTOTIME;
     // Qwen3-VL with the vision tower: the condition image is read as vision context.
@@ -654,11 +668,18 @@ VARP QwenImage21Diffusion::encodeEditPrompt(const std::string& prompt, VARP bgr,
         return nullptr;
     }
     Transformer::MultimodalPrompt mp;
-    // QwenImage21Pipeline.prompt_template_ti2i; <img>..</img> expands to <|vision_start|><|image_pad|>*n<|vision_end|>
+    // QwenImage21Pipeline.prompt_template_ti2i; <img>..</img> expands to <|vision_start|><|image_pad|>*n<|vision_end|>.
+    // Reference order fixes which image "image 1" / "image 2" in the prompt refers to (matches Qwen-Image-2.1 /
+    // Viggle-turbo's own convention).
+    std::string imgTags;
+    for (size_t i = 0; i < refs.size(); ++i) {
+        std::string key = "cond" + std::to_string(i + 1);
+        imgTags += "<image" + std::to_string(i + 1) + "><img>" + key + "</img>";
+        mp.images[key] = Transformer::PromptImagePart{refs[i].bgr, refs[i].w, refs[i].h};
+    }
     mp.prompt_template = std::string("<|im_start|>system\n") + kSystemPrompt + "<|im_end|>\n<|im_start|>user\n" +
-                         "<image1><img>cond</img>" + (prompt.empty() ? std::string(" ") : prompt) +
+                         imgTags + (prompt.empty() ? std::string(" ") : prompt) +
                          "<|im_end|>\n<|im_start|>assistant\n";
-    mp.images["cond"] = Transformer::PromptImagePart{bgr, w, h};
     auto ids = te->tokenizer_encode(mp);
     if ((int)ids.size() <= mDropIdx || te->forward(ids) == nullptr) {
         MNN_ERROR("[QwenImage21] text encoder (vision) forward failed\n");
@@ -721,104 +742,170 @@ VARP QwenImage21Diffusion::encodeImage(VARP rgb, int w, int h) {
     return hostTensor({1, N, kLatentC}, packed.data());
 }
 
-bool QwenImage21Diffusion::runEdit(const std::string& prompt, const std::string& inputImagePath,
+bool QwenImage21Diffusion::runEdit(const std::string& prompt, const std::vector<std::string>& inputImagePaths,
                                    const std::string& outputPath, int steps, int seed,
                                    std::function<void(int)> progressCallback) {
     AUTOTIME;
     int64_t st = nowUs();
-    auto src = imread(inputImagePath);
-    if (src.get() == nullptr || src->getInfo() == nullptr) {
-        return fail(kModelError, "cannot read input image " + inputImagePath);
+    if (inputImagePaths.empty() || inputImagePaths.size() > 2) {
+        return fail(kModelError, "runEdit takes 1 or 2 reference images");
     }
-    int srcH = src->getInfo()->dim[0], srcW = src->getInfo()->dim[1];
-    int w, h;
-    editSize(srcW, srcH, w, h);
-    mLatentW = w / 16;
-    mLatentH = h / 16;
-    // imread returns BGR (a pure red PNG reads back as 0,0,255). Omni's vision path takes BGR and converts to RGB
-    // itself; the VAE encoder wants RGB. Getting this backwards tints skin teal in the output, because the model
-    // copies the colours it sees in the condition image.
-    auto bgr = resize(src, {w, h}, 0, 0, INTER_CUBIC);
-    bgr.fix(VARP::CONSTANT);
-    auto rgb = cvtColor(bgr, COLOR_BGR2RGB);
-    rgb.fix(VARP::CONSTANT);
-    MNN_PRINT("[QwenImage21] edit: input %dx%d -> %dx%d\n", srcW, srcH, w, h);
+    // Each reference is independently resized to its own aspect ratio at mRefAreaScale times the configured area
+    // (condSize()); the *output*'s size/aspect is always taken from the last reference at full area (editSize()),
+    // matching Qwen-Image-2.1's own "no height/width given -> follow the last reference" convention.
+    std::vector<RefImage> refs;
+    std::vector<int> nc(inputImagePaths.size());  // condition latent-token count per reference
+    for (size_t i = 0; i < inputImagePaths.size(); ++i) {
+        auto src = imread(inputImagePaths[i]);
+        if (src.get() == nullptr || src->getInfo() == nullptr) {
+            return fail(kModelError, "cannot read input image " + inputImagePaths[i]);
+        }
+        int srcH = src->getInfo()->dim[0], srcW = src->getInfo()->dim[1];
+        if (i + 1 == inputImagePaths.size()) {
+            int outW, outH;
+            editSize(srcW, srcH, outW, outH);
+            mLatentW = outW / 16;
+            mLatentH = outH / 16;
+        }
+        int w, h;
+        condSize(srcW, srcH, w, h);
+        // imread returns BGR (a pure red PNG reads back as 0,0,255). Omni's vision path takes BGR and converts to
+        // RGB itself; the VAE encoder wants RGB. Getting this backwards tints skin teal in the output, because the
+        // model copies the colours it sees in the condition image.
+        auto bgr = resize(src, {w, h}, 0, 0, INTER_CUBIC);
+        bgr.fix(VARP::CONSTANT);
+        auto rgb = cvtColor(bgr, COLOR_BGR2RGB);
+        rgb.fix(VARP::CONSTANT);
+        MNN_PRINT("[QwenImage21] edit: reference %zu %dx%d -> %dx%d\n", i + 1, srcW, srcH, w, h);
+        refs.push_back({bgr, rgb, w, h});
+        nc[i] = (w / 16) * (h / 16);
+    }
+    const int outW = mLatentW * 16, outH = mLatentH * 16;
+    MNN_PRINT("[QwenImage21] edit: output %dx%d\n", outW, outH);
 
     std::vector<char> isPad;
     if (!ensureMemory("text encoder", teNeedMB(true))) return false;
-    auto text = encodeEditPrompt(prompt, bgr, w, h, isPad);
+    auto text = encodeEditPrompt(prompt, refs, isPad);
     if (text.get() == nullptr) return failStage("text encoder (vision)");
     if (progressCallback) progressCallback(3);
-    if (!ensureMemory("VAE encoder", vaeEncodeNeedMB(w, h))) return false;
-    auto cond = encodeImage(rgb, w, h);
-    if (cond.get() == nullptr) return failStage("VAE encoder");
+    std::vector<VARP> cond(refs.size());
+    for (size_t i = 0; i < refs.size(); ++i) {
+        if (!ensureMemory("VAE encoder", vaeEncodeNeedMB(refs[i].w, refs[i].h))) return false;
+        cond[i] = encodeImage(refs[i].rgb, refs[i].w, refs[i].h);
+        if (cond[i].get() == nullptr) return failStage("VAE encoder");
+    }
     if (progressCallback) progressCallback(5);
 
-    // Layout [t1 text][condition latents][t2 text] + target, see export/qwen_image21_mnn.py:edit_layout
-    const int hc = mLatentH, wc = mLatentW, nc = hc * wc;
+    // Layout [t1 text][ref1 latents][... text ...][refN latents][tLast text] + target, generalizing
+    // export/qwen_image21_mnn.py:edit_layout to N references. Block boundaries come from the token counts we
+    // already know (nc[i] / 4 slots each), not from scanning runs of True in isPad -- two adjacent references
+    // with no text between them would otherwise merge into one run and wrongly attend to each other bidirectionally.
     int L = (int)isPad.size();
-    int first = -1, nslots = 0;
-    for (int i = 0; i < L; ++i) {
-        if (isPad[i]) {
-            if (first < 0) first = i;
-            ++nslots;
-        }
-    }
-    if (first < 0 || nslots * 4 != nc) {
+    std::vector<int> padPositions;
+    for (int i = 0; i < L; ++i) if (isPad[i]) padPositions.push_back(i);
+    int totalSlots = 0;
+    for (int i = 0; i < (int)nc.size(); ++i) totalSlots += nc[i] / 4;
+    if ((int)padPositions.size() != totalSlots) {
         char buf[160];
-        snprintf(buf, sizeof(buf), "vision slots %d do not match %dx%d latent tokens", nslots, hc, wc);
+        snprintf(buf, sizeof(buf), "vision slots %d do not match %d expected latent-token slots",
+                 (int)padPositions.size(), totalSlots);
         return fail(kRuntimeError, buf);
     }
-    const int t1 = first, t2 = L - first - nslots, P = t1 + nc + t2;
+    struct Seg { bool isImage; int len; int refIdx; };  // refIdx valid when isImage
+    std::vector<Seg> segs;
+    int cursor = 0, slotCursor = 0;
+    for (size_t i = 0; i < refs.size(); ++i) {
+        int nslots = nc[i] / 4;
+        int firstPad = padPositions[slotCursor];
+        int lastPad = padPositions[slotCursor + nslots - 1];
+        if (lastPad - firstPad + 1 != nslots) {
+            return fail(kRuntimeError, "vision slots for one reference are not contiguous");
+        }
+        if (firstPad > cursor) segs.push_back({false, firstPad - cursor, -1});
+        segs.push_back({true, nc[i], (int)i});
+        cursor = firstPad + nslots;
+        slotCursor += nslots;
+    }
+    if (cursor < L) segs.push_back({false, L - cursor, -1});
+    int P = 0;
+    for (auto& s : segs) P += s.len;
     {
         dump("edit_text_hidden", text->readMap<float>(), (size_t)L * kDim);
         std::vector<float> padf(isPad.begin(), isPad.end());
         dump("edit_is_pad", padf.data(), padf.size());
-        dump("edit_cond", cond->readMap<float>(), (size_t)nc * kLatentC);
+        for (size_t i = 0; i < cond.size(); ++i) {
+            dump(("edit_cond" + std::to_string(i + 1)).c_str(), cond[i]->readMap<float>(), (size_t)nc[i] * kLatentC);
+        }
     }
 
     // text rows without the image slots -> txt_in; condition latents -> img_in
-    std::vector<float> textRows((size_t)(t1 + t2) * kDim);
-    const float* tp = text->readMap<float>();
-    ::memcpy(textRows.data(), tp, (size_t)t1 * kDim * sizeof(float));
-    ::memcpy(textRows.data() + (size_t)t1 * kDim, tp + (size_t)(first + nslots) * kDim, (size_t)t2 * kDim * sizeof(float));
+    int textLen = 0;
+    for (auto& s : segs) if (!s.isImage) textLen += s.len;
+    std::vector<float> textRows((size_t)textLen * kDim);
+    {
+        const float* tp = text->readMap<float>();
+        int dst = 0;
+        for (int i = 0; i < L; ++i) {
+            if (!isPad[i]) {
+                ::memcpy(textRows.data() + (size_t)dst * kDim, tp + (size_t)i * kDim, kDim * sizeof(float));
+                ++dst;
+            }
+        }
+    }
     if (!ensureMemory("DiT", ditNeedMB(P, mLatentH * mLatentW))) return false;
-    auto txtH = embedText(hostTensor({1, t1 + t2, kDim}, textRows.data()));
+    auto txtH = embedText(hostTensor({1, textLen, kDim}, textRows.data()));
     if (txtH.get() == nullptr) return failStage("text projection");
     if (!mImgIn) mImgIn = loadModule("img_in.mnn", {"lat"}, {"img_h"}, runtime_manager_);
-    std::vector<float> condHost(cond->readMap<float>(), cond->readMap<float>() + (size_t)nc * kLatentC);
-    auto condIn = _Input({1, nc, kLatentC}, NCHW, halide_type_of<float>());
-    ::memcpy(condIn->writeMap<float>(), condHost.data(), condHost.size() * sizeof(float));
-    auto condOut = mImgIn->onForward({condIn});
-    if (condOut.empty()) return failStage("image projection");
-    auto condH = hostCopy(condOut[0]);
-    condOut.clear();
-    std::vector<float> prefix((size_t)P * kDim);
-    const float* th = txtH->readMap<float>();
-    ::memcpy(prefix.data(), th, (size_t)t1 * kDim * sizeof(float));
-    ::memcpy(prefix.data() + (size_t)t1 * kDim, condH->readMap<float>(), (size_t)nc * kDim * sizeof(float));
-    ::memcpy(prefix.data() + (size_t)(t1 + nc) * kDim, th + (size_t)t1 * kDim, (size_t)t2 * kDim * sizeof(float));
+    std::vector<VARP> condH(refs.size());
+    for (size_t i = 0; i < refs.size(); ++i) {
+        std::vector<float> condHost(cond[i]->readMap<float>(), cond[i]->readMap<float>() + (size_t)nc[i] * kLatentC);
+        auto condIn = _Input({1, nc[i], kLatentC}, NCHW, halide_type_of<float>());
+        ::memcpy(condIn->writeMap<float>(), condHost.data(), condHost.size() * sizeof(float));
+        auto condOut = mImgIn->onForward({condIn});
+        if (condOut.empty()) return failStage("image projection");
+        condH[i] = hostCopy(condOut[0]);
+        dump(("edit_cond_h" + std::to_string(i + 1)).c_str(), condH[i]->readMap<float>(), (size_t)nc[i] * kDim);
+    }
 
-    std::vector<int> f, hp, wp;
-    appendText(0, t1, f, hp, wp);
-    appendGrid(t1, hc, wc, f, hp, wp);
-    int start2 = t1 + std::max(hc, wc);
-    appendText(start2, t2, f, hp, wp);
-    appendGrid(start2 + t2, mLatentH, mLatentW, f, hp, wp);
+    // Walk the segments to build the joint prefix, its RoPE positions (frame axis frozen per image block, exactly
+    // as QwenImage21Rope.forward does for img_shapes), and a block id per token (-1 for text, a unique id per
+    // reference) used below for the block-causal mask.
+    std::vector<float> prefix((size_t)P * kDim);
+    std::vector<int> f, hp, wp, blockId;
+    blockId.reserve(P);
+    int dst = 0, textCursor = 0, position = 0;
+    const float* th = txtH->readMap<float>();
+    for (auto& s : segs) {
+        if (!s.isImage) {
+            appendText(position, s.len, f, hp, wp);
+            ::memcpy(prefix.data() + (size_t)dst * kDim, th + (size_t)textCursor * kDim, (size_t)s.len * kDim * sizeof(float));
+            for (int i = 0; i < s.len; ++i) blockId.push_back(-1);
+            textCursor += s.len;
+            dst += s.len;
+            position += s.len;
+        } else {
+            int hc = refs[s.refIdx].h / 16, wc = refs[s.refIdx].w / 16;
+            appendGrid(position, hc, wc, f, hp, wp);
+            ::memcpy(prefix.data() + (size_t)dst * kDim, condH[s.refIdx]->readMap<float>(), (size_t)s.len * kDim * sizeof(float));
+            for (int i = 0; i < s.len; ++i) blockId.push_back(s.refIdx);
+            dst += s.len;
+            position += std::max(hc, wc);
+        }
+    }
+    appendGrid(position, mLatentH, mLatentW, f, hp, wp);  // target image, after the joint prefix
     std::vector<float> cosTab, sinTab;
     ropeFromPositions(f, hp, wp, cosTab, sinTab);
-    // block-causal: causal everywhere, bidirectional inside the condition image; key 0 is the masked dummy
+    // block-causal: causal everywhere, bidirectional within one reference's own tokens; key 0 is the masked dummy.
+    // References never attend to each other bidirectionally, only causally (later ones see earlier ones), matching
+    // QwenImage21Transformer2DModel.build_token_metadata.
     std::vector<float> mask((size_t)P * (P + 1), kMaskNeg);
     for (int q = 0; q < P; ++q) {
-        bool qImg = q >= t1 && q < t1 + nc;
         for (int k = 0; k < P; ++k) {
-            bool kImg = k >= t1 && k < t1 + nc;
-            if (k <= q || (qImg && kImg)) mask[(size_t)q * (P + 1) + 1 + k] = 0.0f;
+            if (k <= q || (blockId[q] >= 0 && blockId[q] == blockId[k])) mask[(size_t)q * (P + 1) + 1 + k] = 0.0f;
         }
     }
     std::vector<float> cosP(cosTab.begin(), cosTab.begin() + (size_t)P * 64);
     std::vector<float> sinP(sinTab.begin(), sinTab.begin() + (size_t)P * 64);
-    dump("edit_cond_h", condH->readMap<float>(), (size_t)nc * kDim);
     dump("edit_prefix", prefix.data(), prefix.size());
     auto kv = runPrefix(hostTensor({1, P, kDim}, prefix.data()), cosP, sinP, mask);
     if (kv.empty()) return failStage("DiT prefix");
@@ -827,7 +914,7 @@ bool QwenImage21Diffusion::runEdit(const std::string& prompt, const std::string&
                            progressCallback);
     kv.clear();
     if (latents.get() == nullptr) return failStage("DiT denoising");
-    if (!ensureMemory("VAE decoder", vaeDecodeNeedMB(w, h))) return false;
+    if (!ensureMemory("VAE decoder", vaeDecodeNeedMB(outW, outH))) return false;
     auto image = decode(latents);
     if (image.get() == nullptr) return failStage("VAE decoder");
     bool ok = saveRGBA(image, outputPath);
@@ -851,7 +938,7 @@ bool QwenImage21Diffusion::run(const std::string prompt, const std::string outpu
         if (mTurbo) iterNum = 6;  // the LoRA was distilled against exactly this 6-step schedule
         int seed = randomSeed < 0 ? (int)(nowUs() & 0x7fffffff) : randomSeed;
         if (!inputImagePath.empty()) {
-            return runEdit(prompt, inputImagePath, outputPath, iterNum, seed, progressCallback);
+            return runEdit(prompt, std::vector<std::string>{inputImagePath}, outputPath, iterNum, seed, progressCallback);
         }
         mLatentW = mImageWidth / 16;
         mLatentH = mImageHeight / 16;
