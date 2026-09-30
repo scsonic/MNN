@@ -157,7 +157,7 @@ bool QwenImage21Diffusion::load() {
         // keep everything resident
         mTxtIn = loadModule("txt_in.mnn", {"txt"}, {"txt_h"}, runtime_manager_);
         mImgIn = loadModule("img_in.mnn", {"lat"}, {"img_h"}, runtime_manager_);
-        mVae = loadModule("vae_decoder.mnn", {"latent"}, {"image"},
+        mVae = loadModule(mVaeDecFile, {"latent"}, {"image"},
                           runtime_manager_vae_cpu_ ? runtime_manager_vae_cpu_ : runtime_manager_);
         return mTxtIn && mImgIn && mVae;
     }
@@ -462,7 +462,7 @@ VARP QwenImage21Diffusion::decode(VARP packedLatents) {
     AUTOTIME;
     const int N = mLatentH * mLatentW;
     auto vaeRt = runtime_manager_vae_cpu_ ? runtime_manager_vae_cpu_ : runtime_manager_;
-    if (!mVae) mVae = loadModule("vae_decoder.mnn", {"latent"}, {"image"}, vaeRt);
+    if (!mVae) mVae = loadModule(mVaeDecFile, {"latent"}, {"image"}, vaeRt);
     if (!mVae) return nullptr;
     // [1, N, 64] -> [1, 64, H, W]
     std::vector<float> nchw((size_t)kLatentC * N);
@@ -581,6 +581,14 @@ void QwenImage21Diffusion::setRefAreaScale(double scale) {
     mRefAreaScale = std::max(1e-3, std::min(1.0, scale));
 }
 
+void QwenImage21Diffusion::setTinyVae(bool on) {
+    if (on == mTinyVae) return;
+    mTinyVae = on;
+    mVaeDecFile = on ? "vae_decoder_tiny.mnn" : "vae_decoder.mnn";
+    mVaeEncFile = on ? "vae_encoder_tiny.mnn" : "vae_encoder.mnn";
+    mVae.reset();  // force a reload from the new file (only relevant when mMemoryMode == 1 keeps it resident)
+}
+
 bool QwenImage21Diffusion::failStage(const char* stage) {
     int avail = availableMemoryMB();
     bool oom = avail >= 0 && avail < 1500;
@@ -612,8 +620,12 @@ int teNeedMB(bool vision) { return vision ? 6100 : 5600; }
 int ditNeedMB(int prefixLen, int tokens) { return 5000 + (prefixLen + tokens) / 2; }
 // Runtime memory reported on an 8 Gen 2: 320x320 1985 MB, 512x288 2646 MB, 448x576 4266 MB -> ~500 MB fixed
 // (fp16 weights) plus ~3900 MB per 512x512 of pixels.
-int vaeDecodeNeedMB(int w, int h) { return 500 + (int)(3900.0 * w * h / 262144.0); }
-int vaeEncodeNeedMB(int w, int h) { return (int)(1200.0 * w * h / 262144.0); }
+int vaeDecodeNeedMB(int w, int h, bool tiny = false) {
+    return tiny ? 150 + (int)(400.0 * w * h / 262144.0) : 500 + (int)(3900.0 * w * h / 262144.0);
+}
+int vaeEncodeNeedMB(int w, int h, bool tiny = false) {
+    return tiny ? (int)(150.0 * w * h / 262144.0) : (int)(1200.0 * w * h / 262144.0);
+}
 } // namespace
 
 bool QwenImage21Diffusion::ensureMemory(const char* stage, int needMB) {
@@ -715,7 +727,7 @@ VARP QwenImage21Diffusion::encodeEditPrompt(const std::string& prompt, const std
 VARP QwenImage21Diffusion::encodeImage(VARP rgb, int w, int h) {
     AUTOTIME;
     auto rt = runtime_manager_vae_cpu_ ? runtime_manager_vae_cpu_ : runtime_manager_;
-    auto enc = loadModule("vae_encoder.mnn", {"image"}, {"latent"}, rt);
+    auto enc = loadModule(mVaeEncFile, {"image"}, {"latent"}, rt);
     if (!enc) return nullptr;
     // RGB uint8 HWC -> RGBA float NCHW in [-1, 1] (opaque alpha)
     const uint8_t* src = rgb->readMap<uint8_t>();
@@ -790,7 +802,7 @@ bool QwenImage21Diffusion::runEdit(const std::string& prompt, const std::vector<
     if (progressCallback) progressCallback(3);
     std::vector<VARP> cond(refs.size());
     for (size_t i = 0; i < refs.size(); ++i) {
-        if (!ensureMemory("VAE encoder", vaeEncodeNeedMB(refs[i].w, refs[i].h))) return false;
+        if (!ensureMemory("VAE encoder", vaeEncodeNeedMB(refs[i].w, refs[i].h, mTinyVae))) return false;
         cond[i] = encodeImage(refs[i].rgb, refs[i].w, refs[i].h);
         if (cond[i].get() == nullptr) return failStage("VAE encoder");
     }
@@ -914,7 +926,7 @@ bool QwenImage21Diffusion::runEdit(const std::string& prompt, const std::vector<
                            progressCallback);
     kv.clear();
     if (latents.get() == nullptr) return failStage("DiT denoising");
-    if (!ensureMemory("VAE decoder", vaeDecodeNeedMB(outW, outH))) return false;
+    if (!ensureMemory("VAE decoder", vaeDecodeNeedMB(outW, outH, mTinyVae))) return false;
     auto image = decode(latents);
     if (image.get() == nullptr) return failStage("VAE decoder");
     bool ok = saveRGBA(image, outputPath);
@@ -960,7 +972,7 @@ bool QwenImage21Diffusion::run(const std::string prompt, const std::string outpu
                                progressCallback);
         kv.clear();
         if (latents.get() == nullptr) return failStage("DiT denoising");
-        if (!ensureMemory("VAE decoder", vaeDecodeNeedMB(mImageWidth, mImageHeight))) return false;
+        if (!ensureMemory("VAE decoder", vaeDecodeNeedMB(mImageWidth, mImageHeight, mTinyVae))) return false;
         auto image = decode(latents);
         if (image.get() == nullptr) return failStage("VAE decoder");
         bool ok = saveRGBA(image, outputPath);

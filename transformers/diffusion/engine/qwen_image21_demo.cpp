@@ -15,7 +15,7 @@ int main(int argc, const char* argv[]) {
         MNN_PRINT("Usage: %s <model_dir> <output.png> <prompt> [steps=20] [seed=42] [backend=opencl|cpu] "
                   "[memory_mode=0] [te_on_cpu=1] [size=512|WxH] [precision=low|normal|high] [threads=4] "
                   "[vae_on_cpu=0] [input_image (edit mode)] [turbo=0] [input_image2 (2nd edit reference)] "
-                  "[ref_area_scale=1.0]\n", argv[0]);
+                  "[ref_area_scale=1.0] [tiny_vae=0]\n", argv[0]);
         return 1;
     }
     std::string modelDir = argv[1];
@@ -40,6 +40,7 @@ int main(int argc, const char* argv[]) {
     bool turbo = argc > 14 ? atoi(argv[14]) != 0 : false;
     std::string inputImage2 = argc > 15 ? argv[15] : "";
     double refAreaScale = argc > 16 ? atof(argv[16]) : 1.0;
+    bool tinyVae = argc > 17 ? atoi(argv[17]) != 0 : false;
 
     auto type = backend == "cpu" ? MNN_FORWARD_CPU : MNN_FORWARD_OPENCL;
     auto prec = precision == "high" ? PRECISION_HIGH : (precision == "normal" ? PRECISION_NORMAL : PRECISION_LOW);
@@ -53,6 +54,7 @@ int main(int argc, const char* argv[]) {
     if (turbo) d->setTurbo(true);
     auto* qwen = static_cast<QwenImage21Diffusion*>(d.get());  // the only type QWEN_IMAGE_21 produces
     qwen->setRefAreaScale(refAreaScale);
+    if (tinyVae) qwen->setTinyVae(true);
     auto progress = [](int p) { MNN_PRINT("progress %d%%\n", p); };
     bool ok;
     if (!inputImage2.empty()) {
