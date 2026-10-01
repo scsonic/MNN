@@ -87,8 +87,8 @@ QwenImage21Diffusion::QwenImage21Diffusion(std::string modelPath, DiffusionModel
     }
     int w = mImageWidth > 0 ? mImageWidth : 512;
     int h = mImageHeight > 0 ? mImageHeight : 512;
-    mImageWidth = std::max(256, (w / 32) * 32);
-    mImageHeight = std::max(256, (h / 32) * 32);
+    mImageWidth = std::max(32, (w / 32) * 32);
+    mImageHeight = std::max(32, (h / 32) * 32);
     mLatentW = mImageWidth / 16;
     mLatentH = mImageHeight / 16;
     MNN_PRINT("[QwenImage21] image=%dx%d latent tokens=%dx%d\n", mImageWidth, mImageHeight, mLatentH, mLatentW);
@@ -587,8 +587,8 @@ void QwenImage21Diffusion::setDit2Bit(bool on) {
 }
 
 void QwenImage21Diffusion::setImageSize(int width, int height) {
-    mImageWidth = std::max(256, (width / 32) * 32);
-    mImageHeight = std::max(256, (height / 32) * 32);
+    mImageWidth = std::max(32, (width / 32) * 32);
+    mImageHeight = std::max(32, (height / 32) * 32);
 }
 
 void QwenImage21Diffusion::setRefAreaScale(double scale) {
@@ -662,8 +662,8 @@ void QwenImage21Diffusion::editSize(int srcW, int srcH, int& w, int& h) const {
     double area = (double)mImageWidth * mImageHeight;
     double ratio = (double)srcW / srcH;
     double fw = std::sqrt(area * ratio);
-    w = std::max(256, (int)std::lround(fw / 32.0) * 32);
-    h = std::max(256, (int)std::lround(fw / ratio / 32.0) * 32);
+    w = std::max(32, (int)std::lround(fw / 32.0) * 32);
+    h = std::max(32, (int)std::lround(fw / ratio / 32.0) * 32);
 }
 
 void QwenImage21Diffusion::condSize(int srcW, int srcH, int& w, int& h) const {
@@ -672,8 +672,8 @@ void QwenImage21Diffusion::condSize(int srcW, int srcH, int& w, int& h) const {
     double area = (double)mImageWidth * mImageHeight * mRefAreaScale;
     double ratio = (double)srcW / srcH;
     double fw = std::sqrt(area * ratio);
-    w = std::max(256, (int)std::lround(fw / 32.0) * 32);
-    h = std::max(256, (int)std::lround(fw / ratio / 32.0) * 32);
+    w = std::max(32, (int)std::lround(fw / 32.0) * 32);
+    h = std::max(32, (int)std::lround(fw / ratio / 32.0) * 32);
 }
 
 VARP QwenImage21Diffusion::encodeEditPrompt(const std::string& prompt, const std::vector<RefImage>& refs,
