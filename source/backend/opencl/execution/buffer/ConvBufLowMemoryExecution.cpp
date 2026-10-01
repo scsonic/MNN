@@ -72,7 +72,11 @@ static FPWeightGemmShape getFPWeightGemmShape(const std::vector<int>& inputShape
 
 // set mDequantScale mDequantOffset mNumQuantBit mFilterDataPtr from mConv2dParams
 void ConvBufLowMemoryExecution::getInfoFromOpLowMemory(void* weight_ptr) {
-    auto quanCommon = ConvolutionCommon::load(mOp, this->backend(), false, true, weight_ptr);
+    // Kept alive in mQuanCommon: for 2/3bit forceQuant, quanCommon->weight (aliased by mFilterDataPtr below) is a
+    // fresh allocation owned by this Int8Common, not by weight_ptr -- see the memcpy in set1x1WeightLowMemory /
+    // setGeneralWeightLowMemory, which runs after this function has returned.
+    mQuanCommon = ConvolutionCommon::load(mOp, this->backend(), false, true, weight_ptr);
+    auto& quanCommon = mQuanCommon;
     if (quanCommon == nullptr) {
         mValid = false;
         auto staticMapAlloc = mOpenCLBackend->getStaticAllocatorMMap();
@@ -177,9 +181,12 @@ void ConvBufLowMemoryExecution::getInfoFromOpLowMemory(void* weight_ptr) {
                         for (int j = 0; j < mResource->mBlockSize; ++j) {
                             float o = srcZ[2 * j + 0];
                             float s = srcZ[2 * j + 1];
-                            // For int4, absorb -8 bias into offset: offset_new = offset - 8 * scale
-                            if (mResource->mNumQuantBit == 4) {
-                                o = o - 8.0f * s;
+                            // The w2/w3/w4 unpack macros multiply by the RAW (uncentered) stored code, so the
+                            // centering they'd otherwise need (-2/-4/-8) must be folded into the offset here:
+                            // offset_new = offset - (1 << (bit-1)) * scale. int8 keeps its own convention untouched.
+                            if (mResource->mNumQuantBit == 2 || mResource->mNumQuantBit == 3 ||
+                                mResource->mNumQuantBit == 4) {
+                                o = o - (float)(1 << (mResource->mNumQuantBit - 1)) * s;
                             }
                             ((half_float::half*)dequantScaleOffsetBufferMap)[(j * numAlphaPack + i) * 2] =
                                 (half_float::half)(s * coef);
@@ -211,9 +218,10 @@ void ConvBufLowMemoryExecution::getInfoFromOpLowMemory(void* weight_ptr) {
                         for (int j = 0; j < mResource->mBlockSize; ++j) {
                             float o = srcZ[2 * j + 0];
                             float s = srcZ[2 * j + 1];
-                            // For int4, absorb -8 bias into offset: offset_new = offset - 8 * scale
-                            if (mResource->mNumQuantBit == 4) {
-                                o = o - 8.0f * s;
+                            // See the matching fp16 branch above for why this folding is needed for w2/w3/w4.
+                            if (mResource->mNumQuantBit == 2 || mResource->mNumQuantBit == 3 ||
+                                mResource->mNumQuantBit == 4) {
+                                o = o - (float)(1 << (mResource->mNumQuantBit - 1)) * s;
                             }
                             ((float*)dequantScaleOffsetBufferMap)[(j * numAlphaPack + i) * 2] = s * coef;
                             ((float*)dequantScaleOffsetBufferMap)[(j * numAlphaPack + i) * 2 + 1] = o * coef;

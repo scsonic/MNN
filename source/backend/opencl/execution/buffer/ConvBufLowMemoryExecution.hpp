@@ -42,6 +42,11 @@ private:
     std::vector<uint32_t> mGlobalWorkSize{1, 1, 1};
     std::vector<uint32_t> mLocalWorkSize{1, 1, 1, 1};
     void *mFilterDataPtr = nullptr;
+    // Owns the buffer mFilterDataPtr points into for 2/3bit forceQuant (ConvolutionCommon::load allocates it
+    // separately from the caller-provided weight_ptr there -- see getInfoFromOpLowMemory). Without this, the
+    // Int8Common returned by load() would be destroyed when getInfoFromOpLowMemory() returns, freeing the
+    // buffer before set1x1WeightLowMemory()/setGeneralWeightLowMemory() can memcpy from it.
+    std::shared_ptr<ConvolutionCommon::Int8Common> mQuanCommon;
     bool mUseFPWeight = false;
     std::shared_ptr<Tensor> mConvGemmInpTensor;
     std::shared_ptr<Tensor> mConvGemmOutTensor;
