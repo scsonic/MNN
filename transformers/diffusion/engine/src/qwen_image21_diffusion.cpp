@@ -565,10 +565,24 @@ int QwenImage21Diffusion::availableMemoryMB() {
     return -1;
 }
 
+namespace {
+std::string ditFileFor(bool dit2Bit, bool turbo) {
+    if (dit2Bit) return turbo ? "dit_2bit_turbo.mnn" : "dit_2bit.mnn";
+    return turbo ? "dit_turbo.mnn" : "dit.mnn";
+}
+}  // namespace
+
 void QwenImage21Diffusion::setTurbo(bool on) {
     if (on == mTurbo) return;
     mTurbo = on;
-    mDitFile = on ? "dit_turbo.mnn" : "dit.mnn";
+    mDitFile = ditFileFor(mDit2Bit, mTurbo);
+    mDitStep.reset();  // force a reload from the new file on the next denoise()
+}
+
+void QwenImage21Diffusion::setDit2Bit(bool on) {
+    if (on == mDit2Bit) return;
+    mDit2Bit = on;
+    mDitFile = ditFileFor(mDit2Bit, mTurbo);
     mDitStep.reset();  // force a reload from the new file on the next denoise()
 }
 
